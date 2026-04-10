@@ -6,6 +6,10 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
+    "docker:build": "docker compose build",
+    "docker:deploy": "docker compose up -d --build",
+    "docker:down": "docker compose down",
+    "docker:logs": "docker compose logs -f app",
     "lint": "eslint"
   },
   "dependencies": {
