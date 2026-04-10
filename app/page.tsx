@@ -27,6 +27,7 @@ import {
   FaTrashAlt,
   FaVial
 } from "react-icons/fa";
+import { parseCcSwitchSqlProviders } from "@/lib/cc-switch-sql";
 import type {
   OpenAIProxyBenchmarkRoundResponse,
   OpenAIProxyProbeResponse,
@@ -565,6 +566,18 @@ function finalizeParsed(items: Partial<ParsedConfig>[], startIndex: number): Par
   }));
 }
 
+function createKeyConfigsFromParsed(items: ParsedConfig[]): KeyConfig[] {
+  return items.map((item) => ({
+    id: crypto.randomUUID(),
+    name: item.name,
+    baseUrl: item.baseUrl,
+    apiKey: item.apiKey,
+    model: item.model,
+    createdAt: new Date().toISOString(),
+    sourceMeta: item.sourceMeta || { kind: "manual" }
+  }));
+}
+
 function parsePastedConfigs(input: string, startIndex: number): ParsedConfig[] {
   const text = input.trim();
   if (!text) return [];
@@ -574,6 +587,21 @@ function parsePastedConfigs(input: string, startIndex: number): ParsedConfig[] {
     .filter((item): item is Partial<ParsedConfig> => Boolean(item));
   const fromDeepLinks = finalizeParsed(deepLinks, startIndex);
   if (fromDeepLinks.length > 0) return fromDeepLinks;
+
+  const fromCcSwitchSql = finalizeParsed(
+    parseCcSwitchSqlProviders(text).map((item) => ({
+      name: item.name,
+      baseUrl: item.baseUrl,
+      apiKey: item.apiKey,
+      model: item.model,
+      sourceMeta: {
+        kind: "cc-switch-provider" as const,
+        ccSwitchApp: item.appType
+      }
+    })),
+    startIndex
+  );
+  if (fromCcSwitchSql.length > 0) return fromCcSwitchSql;
 
   try {
     const parsed = JSON.parse(text) as unknown;
@@ -1440,6 +1468,7 @@ function HelpHint({ text }: { text: string }) {
 }
 
 export default function Home() {
+  const ccSwitchSqlInputRef = useRef<HTMLInputElement | null>(null);
   const [configs, setConfigs] = useState<KeyConfig[]>([]);
   const [form, setForm] = useState<FormState>({ name: "", baseUrl: "", apiKey: "", model: "" });
   const [formSourceMeta, setFormSourceMeta] = useState<KeyConfig["sourceMeta"]>();
@@ -1998,6 +2027,20 @@ export default function Home() {
     setPasteRaw("");
   }
 
+  function prependParsedConfigs(parsed: ParsedConfig[], noticeText: string) {
+    if (parsed.length === 0) {
+      setNotice("未识别到可导入配置");
+      return;
+    }
+
+    const newItems = createKeyConfigsFromParsed(parsed);
+    setConfigs((prev) => [...newItems, ...prev]);
+    setForm({ name: "", baseUrl: "", apiKey: "", model: "" });
+    setFormSourceMeta(undefined);
+    setPasteRaw("");
+    setNotice(noticeText.replace("{count}", String(newItems.length)));
+  }
+
   function addFromPaste() {
     const parsed = parsePastedConfigs(pasteRaw, nextIndex);
     if (parsed.length === 0) {
@@ -2005,21 +2048,34 @@ export default function Home() {
       return;
     }
 
-    const newItems: KeyConfig[] = parsed.map((item) => ({
-      id: crypto.randomUUID(),
-      name: item.name,
-      baseUrl: item.baseUrl,
-      apiKey: item.apiKey,
-      model: item.model,
-      createdAt: new Date().toISOString(),
-      sourceMeta: item.sourceMeta || { kind: "manual" }
-    }));
+    prependParsedConfigs(parsed, "已新增 {count} 个配置");
+  }
 
-    setConfigs((prev) => [...newItems, ...prev]);
-    setForm({ name: "", baseUrl: "", apiKey: "", model: "" });
-    setFormSourceMeta(undefined);
-    setPasteRaw("");
-    setNotice(`已新增 ${newItems.length} 个配置`);
+  function openCcSwitchSqlFilePicker() {
+    ccSwitchSqlInputRef.current?.click();
+  }
+
+  async function importCcSwitchSqlFile(file: File) {
+    const content = await file.text();
+    const parsed = parsePastedConfigs(content, nextIndex);
+    if (parsed.length === 0) {
+      setNotice("未从 cc-switch SQL 中识别到可导入配置");
+      return;
+    }
+
+    prependParsedConfigs(parsed, "已从 cc-switch SQL 导入 {count} 个配置");
+  }
+
+  async function handleCcSwitchSqlFileChange(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+
+    try {
+      await importCcSwitchSqlFile(file);
+    } catch {
+      setNotice("读取 cc-switch SQL 文件失败");
+    }
   }
 
   function addConfig(e: React.FormEvent<HTMLFormElement>) {
@@ -2864,7 +2920,7 @@ export default function Home() {
         {introExpanded ? (
           <>
             <p className="mt-2 text-sm leading-6 text-emerald-800">
-              统一管理名称、地址、Key 和模型，支持一键测试、模型识别、性能评测和唤起 CC Switch；配置数据默认仅保存在当前浏览器本地。
+              统一管理名称、地址、Key 和模型，支持粘贴导入、cc-switch SQL 文件导入、一键测试、模型识别、性能评测和唤起 CC Switch；配置数据默认仅保存在当前浏览器本地。
             </p>
             <div className="mt-2 rounded-xl border border-amber-200 bg-amber-50/80 p-3">
               <div className="flex items-start gap-2.5">
@@ -2891,13 +2947,20 @@ export default function Home() {
             <span className="text-xs text-zinc-500">{configs.length} 条配置</span>
           </div>
 
-          <label className={labelClass}>粘贴内容（支持一次解析多个配置）</label>
+          <label className={labelClass}>粘贴内容（支持一次解析多个配置，也支持 cc-switch SQL 文本）</label>
           <textarea
             className={inputClass}
             value={pasteRaw}
             onChange={(e) => setPasteRaw(e.target.value)}
-            placeholder="可粘贴 curl、JSON、环境变量、ccswitch:// 链接、多个配置块"
+            placeholder="可粘贴 curl、JSON、环境变量、ccswitch:// 链接、cc-switch 导出的 SQL、多个配置块"
             rows={3}
+          />
+          <input
+            ref={ccSwitchSqlInputRef}
+            type="file"
+            accept=".sql,text/sql,text/plain"
+            className="hidden"
+            onChange={handleCcSwitchSqlFileChange}
           />
 
           <div className="mt-2 flex flex-wrap gap-2">
@@ -2908,6 +2971,10 @@ export default function Home() {
             <button type="button" className={btnPrimary} onClick={addFromPaste}>
               <FaPaste aria-hidden />
               <span>粘贴并直接新增</span>
+            </button>
+            <button type="button" className={btnGhost} onClick={openCcSwitchSqlFilePicker}>
+              <FaPaste aria-hidden />
+              <span>导入 cc-switch SQL</span>
             </button>
           </div>
 
