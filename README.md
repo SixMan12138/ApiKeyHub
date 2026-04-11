@@ -18,6 +18,7 @@
 ### 📥 导入解析
 
 - 支持粘贴解析，能识别 `curl`、JSON、环境变量风格文本、结构化文本块、`ccswitch://` 链接
+- 支持导入 `cc-switch` 导出的 `.sql` 文件，也支持直接粘贴 SQL 文本
 - 支持一次粘贴多个配置，解析后可批量直接新增
 - 支持把解析结果先回填到表单，再决定要不要保存
 
@@ -83,6 +84,29 @@ npm run start
 ```
 
 部署到支持 Next.js 的平台也没问题，比如 Vercel、Netlify 等。
+
+## Docker 一键部署
+
+项目已经带好 `Dockerfile` 和 `docker-compose.yml`，本机装好 Docker 后，直接执行:
+
+```bash
+npm run docker:deploy
+```
+
+默认会自动构建镜像并在后台启动容器，然后访问 [http://localhost:3000](http://localhost:3000)。
+
+常用命令:
+
+```bash
+npm run docker:logs
+npm run docker:down
+```
+
+如果你不想走 `npm` 脚本，也可以直接用:
+
+```bash
+docker compose up -d --build
+```
 
 ## 使用方式很简单
 
