@@ -26,7 +26,7 @@ type StreamTextResult = {
   error?: string;
 };
 
-type TestResponseSource = "stream" | "chat" | "responses";
+type TestResponseSource = "stream" | "chat" | "responses" | "messages";
 type SourcedModelTextResult = ModelTextResult & {
   source: TestResponseSource;
 };
@@ -118,6 +118,7 @@ function toOpenAIBaseUrl(raw: string): string {
 
   const withoutEndpoint = normalized
     .replace(/\/chat\/completions$/i, "")
+    .replace(/\/messages$/i, "")
     .replace(/\/responses$/i, "")
     .replace(/\/response$/i, "")
     .replace(/\/completions$/i, "");
@@ -393,6 +394,76 @@ async function requestResponsesText(
     }
 
     const text = extractResponsesText(payload);
+    if (text) {
+      return { ok: true, text, elapsedMs };
+    }
+
+    return { ok: false, text: "", elapsedMs, error: "未返回消息内容" };
+  } catch (error: unknown) {
+    return {
+      ok: false,
+      text: "",
+      elapsedMs: Math.round(performance.now() - startedAt),
+      error: makeErrorDetail(error),
+    };
+  }
+}
+
+async function requestMessagesText(
+  baseUrl: string,
+  apiKey: string,
+  model: string,
+  prompt: string,
+): Promise<ModelTextResult> {
+  const startedAt = performance.now();
+
+  try {
+    const response = await fetchWithTimeout(
+      `${baseUrl}/messages`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: "user", content: prompt }],
+          max_tokens: 48,
+        }),
+      },
+      12000,
+    );
+
+    let payload: unknown = null;
+    try {
+      payload = await response.json();
+    } catch {
+      payload = null;
+    }
+
+    const elapsedMs = Math.round(performance.now() - startedAt);
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        text: "",
+        elapsedMs,
+        error: getErrorMessage(payload) || `HTTP ${response.status}`,
+      };
+    }
+
+    if (isRecord(payload) && "error" in payload) {
+      return {
+        ok: false,
+        text: "",
+        elapsedMs,
+        error: getErrorMessage(payload) || "模型不可用或上游渠道异常",
+      };
+    }
+
+    const text = isRecord(payload) ? toReadableResponseText(payload.content) : "";
     if (text) {
       return { ok: true, text, elapsedMs };
     }
@@ -712,24 +783,36 @@ export async function runOpenAITest(input: OpenAIProxyTestRequest): Promise<Open
   }
 
   const model = input.model?.trim() || "gpt-4o-mini";
+  const apiFormat = input.apiFormat || "auto";
   const attempts: SourcedModelTextResult[] = [];
 
-  const streamResponse = await requestModelTextStream(baseUrl, apiKey, model, prompt, 48);
-  attempts.push({ ...streamResponse, source: "stream" });
-
-  if (!(streamResponse.ok && !isLowSignalResponseText(streamResponse.text))) {
+  if (apiFormat === "chat") {
     const chatResponse = await requestModelText(baseUrl, apiKey, model, prompt, 48);
     attempts.push({ ...chatResponse, source: "chat" });
+  } else if (apiFormat === "responses") {
+    const responsesResponse = await requestResponsesText(baseUrl, apiKey, model, prompt);
+    attempts.push({ ...responsesResponse, source: "responses" });
+  } else if (apiFormat === "messages") {
+    const messagesResponse = await requestMessagesText(baseUrl, apiKey, model, prompt);
+    attempts.push({ ...messagesResponse, source: "messages" });
+  } else {
+    const streamResponse = await requestModelTextStream(baseUrl, apiKey, model, prompt, 48);
+    attempts.push({ ...streamResponse, source: "stream" });
 
-    const shouldTryResponses =
-      !chatResponse.ok ||
-      isLowSignalResponseText(chatResponse.text) ||
-      shouldTryResponsesFallback(streamResponse.error || "") ||
-      shouldTryResponsesFallback(chatResponse.error || "");
+    if (!(streamResponse.ok && !isLowSignalResponseText(streamResponse.text))) {
+      const chatResponse = await requestModelText(baseUrl, apiKey, model, prompt, 48);
+      attempts.push({ ...chatResponse, source: "chat" });
 
-    if (shouldTryResponses) {
-      const responsesResponse = await requestResponsesText(baseUrl, apiKey, model, prompt);
-      attempts.push({ ...responsesResponse, source: "responses" });
+      const shouldTryResponses =
+        !chatResponse.ok ||
+        isLowSignalResponseText(chatResponse.text) ||
+        shouldTryResponsesFallback(streamResponse.error || "") ||
+        shouldTryResponsesFallback(chatResponse.error || "");
+
+      if (shouldTryResponses) {
+        const responsesResponse = await requestResponsesText(baseUrl, apiKey, model, prompt);
+        attempts.push({ ...responsesResponse, source: "responses" });
+      }
     }
   }
 
@@ -737,7 +820,13 @@ export async function runOpenAITest(input: OpenAIProxyTestRequest): Promise<Open
 
   if (bestResponse) {
     const sourceLabel =
-      bestResponse.source === "stream" ? "流式" : bestResponse.source === "responses" ? "Responses" : "普通";
+      bestResponse.source === "stream"
+        ? "流式"
+        : bestResponse.source === "responses"
+          ? "Responses"
+          : bestResponse.source === "messages"
+            ? "Messages"
+            : "普通";
     return {
       ok: true,
       result: {

@@ -14,6 +14,7 @@ export async function POST(request: NextRequest) {
         baseUrl: typeof body.baseUrl === "string" ? body.baseUrl : "",
         apiKey: typeof body.apiKey === "string" ? body.apiKey : "",
         model: typeof body.model === "string" ? body.model : "",
+        apiFormat: body.apiFormat === "chat" || body.apiFormat === "responses" || body.apiFormat === "messages" ? body.apiFormat : "auto"
       }),
     );
   } catch {
