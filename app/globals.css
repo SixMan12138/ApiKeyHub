@@ -1,7 +1,43 @@
 @import "tailwindcss";
 
+/* 让 Tailwind v4 的 dark: 变体跟随 <html> 上的 .dark 类，
+   而不是 prefers-color-scheme 媒体查询。 */
+@custom-variant dark (&:where(.dark, .dark *));
+
 :root {
   color-scheme: light;
+  /* 语义化色板（亮色）：暖白底 + emerald 强调 */
+  --bg-page: #f6f7f5;        /* 带极淡冷绿调的米白 */
+  --bg-card: #ffffff;        /* white */
+  --bg-muted: #eef0ec;      /* 暖灰偏绿 */
+  --bg-subtle: #f9faf7;
+  --border-default: #e2e4df; /* 暖灰边框 */
+  --border-strong: #cdcfca;
+  --text-strong: #1c201b;   /* 近黑带绿 */
+  --text-body: #41484a;      /* 主文 */
+  --text-muted: #6b7370;    /* 次文 */
+  --text-faint: #9aa19c;     /* 辅文 */
+  --accent: #0f766e;         /* teal-700 主强调 */
+  --accent-hover: #0d5c56;
+  --overlay: rgba(20, 30, 25, 0.4);
+}
+
+.dark {
+  color-scheme: dark;
+  /* 语义化色板（暗色）：深森林墨绿底，带蓝绿低饱和，避免纯黑 */
+  --bg-page: #0c1110;        /* 极深墨绿黑 */
+  --bg-card: #131a18;        /* 深森林墨绿 */
+  --bg-muted: #1c2622;       /* 略浅的暗绿灰 */
+  --bg-subtle: #161e1b;
+  --border-default: #2a3631; /* 暗绿灰边框 */
+  --border-strong: #3a4942;
+  --text-strong: #e8f0eb;    /* 高亮文字：偏冷绿白 */
+  --text-body: #c7d4cc;      /* 主文：清晰可读 */
+  --text-muted: #94a69b;     /* 次文 */
+  --text-faint: #6f8278;     /* 辅文 */
+  --accent: #34d399;         /* emerald-400 暗色强调（更亮以提升对比） */
+  --accent-hover: #6ee7b7;
+  --overlay: rgba(0, 0, 0, 0.65);
 }
 
 html,
@@ -13,3 +49,47 @@ button:not(:disabled),
 summary {
   cursor: pointer;
 }
+
+/* ----------------------------------------------------------------------------
+   全局暗色覆盖：把页面里硬编码的浅色 Tailwind 工具类，在 .dark 下统一镜像到
+   暗色。这样不依赖给几百处 JSX 逐个补 dark: 别名，一次性接通背景/文字/边框。
+   emerald/teal 等强调色保留原品牌色，仅做轻微亮度补偿。
+---------------------------------------------------------------------------- */
+.dark {
+  /* 页面与卡片底 */
+  --tw: 0;
+}
+.dark body,
+.dark .bg-zinc-50,
+.dark .bg-white,
+.dark .bg-zinc-100 {
+  background-color: var(--bg-card);
+}
+.dark .bg-zinc-50 {
+  background-color: var(--bg-muted);
+}
+.dark .bg-zinc-100 {
+  background-color: var(--bg-muted);
+}
+.dark .bg-white {
+  background-color: var(--bg-card);
+}
+
+/* 边框 */
+.dark .border-zinc-200 { border-color: var(--border-default); }
+.dark .border-zinc-300 { border-color: var(--border-strong); }
+.dark .border-zinc-400 { border-color: var(--border-strong); }
+.dark .border-emerald-200 { border-color: #1f3a33; }
+.dark .ring-emerald-200 { --tw-ring-color: #1f3a33; }
+
+/* 文字颜色：把浅底深字的硬编码统一抬到暗底浅字，确保可读 */
+.dark .text-zinc-900 { color: var(--text-strong); }
+.dark .text-zinc-800 { color: var(--text-strong); }
+.dark .text-zinc-700 { color: var(--text-body); }
+.dark .text-zinc-600 { color: var(--text-body); }
+.dark .text-zinc-500 { color: var(--text-muted); }
+.dark .text-zinc-400 { color: var(--text-faint); }
+
+/* 次级面上的悬浮色 */
+.dark .hover\:bg-zinc-50:hover { background-color: color-mix(in oklab, var(--bg-muted) 60%, transparent); }
+.dark .hover\:bg-zinc-100:hover { background-color: var(--bg-muted); }

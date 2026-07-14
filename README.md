@@ -1,8 +1,8 @@
-# AI Key Vault
+# AI Key Vault / ApiKeyHub
 
 一个更适合自己长期用的 AI API Key 管理小工具。
 
-它不是那种花里胡哨的大平台，核心思路就一件事: 把手上的 Key、地址、模型先收整齐，再用最省事的方式判断它现在到底还能不能用、能看到哪些模型、哪个模型更适合拿来当默认模型。
+它不是那种花里胡哨的大平台，核心思路就一件事：把手上的 Key、地址、模型先收整齐，再用最省事的方式判断它现在到底还能不能用、能看到哪些模型、哪个模型更适合拿来当默认模型。
 
 如果你手里经常有多套 OpenAI 兼容渠道，或者总在不同平台之间来回复制 Key，这个项目基本就是为这种场景准备的。
 
@@ -10,10 +10,11 @@
 
 ### 🔐 配置管理
 
-- 本地保存多组配置，包含名称、Base URL、API Key、默认模型
-- 自动兼容旧版本本地数据，打开页面后会尽量把历史配置接回来
+- 在项目侧持久化多组配置，包含名称、Base URL、API Key、默认模型、API 格式
+- 配置写入项目目录 `data/configs.json`（由 `/api/configs` 原子读写），Docker 部署时可通过 volume 挂载保留
 - 支持复制单条配置，也支持复制全部配置
 - 支持导出 `.txt` 和 `.md`
+- 配置列表支持搜索、筛选，以及按最近测试时间排序
 
 ### 📥 导入解析
 
@@ -25,8 +26,9 @@
 ### ✅ 可用性测试
 
 - 支持单条测试，也支持一键测试全部配置
+- 可按配置选择 API 格式：自动兼容 / Chat Completions / Responses / Anthropic Messages
+- 自动兼容会按 stream → chat → `/responses` 顺序尝试，并在需要时回退
 - 测试结果会记录状态、错误详情、最近测试时间
-- 适合先快速判断某个 Key 和地址现在还能不能打通
 
 ### 🧠 模型识别
 
@@ -47,6 +49,11 @@
 - 支持导出到 CC Switch，也支持直接唤起 CC Switch 导入
 - 当前已适配的目标 App 包括 `Claude`、`Codex`、`Gemini`、`OpenCode`、`OpenClaw`
 
+### 🎨 界面与主题
+
+- 支持浅色 / 深色 / 跟随系统
+- 主题偏好保存在浏览器 `localStorage`，配置数据本身不依赖浏览器本地存储
+
 ## 这个项目适合谁
 
 - 手上有多套 AI API Key，想统一收纳的人
@@ -57,15 +64,15 @@
 
 ## 隐私和数据说明
 
-这个项目默认把配置数据保存在浏览器本地的 `localStorage` 里，不接数据库，也不会帮你托管 Key。
+配置数据默认保存在**项目部署目录**的 `data/configs.json` 中，由同源接口 `/api/configs` 读写。该文件包含 API Key，已被 `.gitignore` / `.dockerignore` 排除，请勿提交到 Git，也不要输出到日志。
 
-但有一点要说明白: 连通性测试、模型识别、性能评测这类真实联网请求，还是会经过项目自己的同源后端接口转发。这样做主要是为了绕开浏览器直连上游时常见的 CORS 问题。
+主题模式仍保存在浏览器 `localStorage`（键名 `ai-key-vault-theme-v1`）。
 
-简单理解就是:
+连通性测试、模型识别、性能评测会经过项目自己的同源后端代理转发，主要是为了绕开浏览器直连上游时的 CORS 限制。简单理解：
 
-- 配置数据默认存在你自己的浏览器里
-- 项目没有做数据库存储逻辑
+- 配置数据存在你自己部署的服务端文件里，不接外部数据库
 - 真正发请求测试时，Key 会参与当前这次后端转发请求
+- 请自行做好部署环境与 `data/` 目录的访问控制
 
 ## 快速开始
 
@@ -76,6 +83,8 @@ npm run dev
 
 打开 [http://localhost:3000](http://localhost:3000) 就能开始用。
 
+首次运行会自动创建 `data/configs.json`；开发时该目录已预留 `.gitkeep`。
+
 ## 打包部署
 
 ```bash
@@ -83,11 +92,11 @@ npm run build
 npm run start
 ```
 
-部署到支持 Next.js 的平台也没问题，比如 Vercel、Netlify 等。
+部署到支持 Next.js 的平台也没问题，比如 Vercel、Netlify 等。若使用无状态托管平台，请注意 `data/configs.json` 可能无法跨实例持久化，此时建议改为挂载持久化存储，或自行扩展存储后端。
 
 ## Docker 一键部署
 
-项目已经带好 `Dockerfile` 和 `docker-compose.yml`，本机装好 Docker 后，直接执行:
+项目已经带好 `Dockerfile` 和 `docker-compose.yml`，本机装好 Docker 后，直接执行：
 
 ```bash
 npm run docker:deploy
@@ -95,14 +104,16 @@ npm run docker:deploy
 
 默认会自动构建镜像并在后台启动容器，然后访问 [http://localhost:3000](http://localhost:3000)。
 
-常用命令:
+`docker-compose.yml` 会把宿主机 `./data` 挂载到容器 `/app/data`，用于持久化配置文件。
+
+常用命令：
 
 ```bash
 npm run docker:logs
 npm run docker:down
 ```
 
-如果你不想走 `npm` 脚本，也可以直接用:
+如果你不想走 `npm` 脚本，也可以直接用：
 
 ```bash
 docker compose up -d --build
@@ -111,10 +122,11 @@ docker compose up -d --build
 ## 使用方式很简单
 
 1. 填一条配置，或者直接把现成的 `curl` / JSON / 文本块粘进来
-2. 点“保存配置”或者“粘贴并直接新增”
-3. 先做连通性测试，确认地址和 Key 没问题
-4. 再做模型识别，看看这个渠道到底开放了哪些模型
-5. 如果模型很多，就打开性能评测，跑几轮后挑一个更适合日常使用的默认模型
+2. 按需选择 API 格式（默认自动兼容）
+3. 点「保存配置」或者「粘贴并直接新增」
+4. 先做连通性测试，确认地址和 Key 没问题
+5. 再做模型识别，看看这个渠道到底开放了哪些模型
+6. 如果模型很多，就打开性能评测，跑几轮后挑一个更适合日常使用的默认模型
 
 ## 技术栈
 
@@ -123,6 +135,10 @@ docker compose up -d --build
 - TypeScript
 - Tailwind CSS 4
 - ECharts
+
+## 仓库
+
+- GitHub：https://github.com/SixMan12138/ApiKeyHub
 
 ## 友链
 

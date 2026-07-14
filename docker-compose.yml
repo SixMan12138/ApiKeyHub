@@ -6,6 +6,8 @@ services:
       dockerfile: Dockerfile
     ports:
       - "3000:3000"
+    volumes:
+      - ./data:/app/data
     environment:
       NODE_ENV: production
       HOSTNAME: 0.0.0.0

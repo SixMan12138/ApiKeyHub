@@ -24,6 +24,10 @@
 .DS_Store
 *.pem
 
+# 持久化 API Key 配置（仅保留目录占位文件）
+/data/*
+!/data/.gitkeep
+
 # debug
 npm-debug.log*
 yarn-debug.log*

@@ -9,19 +9,24 @@ import {
   FaCheckCircle,
   FaChevronDown,
   FaChevronUp,
+  FaCompressArrowsAlt,
   FaCopy,
+  FaDesktop,
   FaEdit,
   FaExchangeAlt,
+  FaExpandArrowsAlt,
   FaFileExport,
-  FaGithub,
   FaInfoCircle,
   FaKey,
   FaLink,
   FaMagic,
+  FaMoon,
   FaPaste,
   FaQuestionCircle,
   FaSave,
+  FaSearch,
   FaSpinner,
+  FaSun,
   FaTag,
   FaTimesCircle,
   FaTrashAlt,
@@ -29,6 +34,7 @@ import {
 } from "react-icons/fa";
 import { parseCcSwitchSqlProviders } from "@/lib/cc-switch-sql";
 import type {
+  OpenAIProxyApiFormat,
   OpenAIProxyBenchmarkRoundResponse,
   OpenAIProxyProbeResponse,
   OpenAIProxyTestResponse
@@ -40,6 +46,8 @@ type KeyConfig = {
   baseUrl: string;
   apiKey: string;
   model: string;
+  apiFormat?: OpenAIProxyApiFormat;
+  listStatus?: "success" | "failed";
   createdAt: string;
   sourceMeta?: {
     kind: "manual" | "cc-switch-provider" | "cc-switch-deeplink";
@@ -57,7 +65,7 @@ type KeyConfig = {
     message: string;
     detail?: string;
     responseText?: string;
-    responseSource?: "stream" | "chat" | "responses";
+    responseSource?: "stream" | "chat" | "responses" | "messages";
     testedAt: string;
   };
   benchmarks?: Record<string, FinishedModelBenchmarkResult>;
@@ -68,18 +76,25 @@ type FormState = {
   baseUrl: string;
   apiKey: string;
   model: string;
+  apiFormat: OpenAIProxyApiFormat;
 };
 
 type ExportType = "md" | "txt";
 type TestStatus = "idle" | "pending" | "success" | "error";
+type NoticeTone = "success" | "error" | "info";
+type NoticeState = {
+  message: string;
+  tone: NoticeTone;
+};
 type CcSwitchApp = "claude" | "codex" | "gemini" | "opencode" | "openclaw";
+type ThemeMode = "system" | "light" | "dark";
 
 type TestResult = {
   status: TestStatus;
   message: string;
   detail?: string;
   responseText?: string;
-  responseSource?: "stream" | "chat" | "responses";
+  responseSource?: "stream" | "chat" | "responses" | "messages";
   testedAt?: string;
 };
 type FinishedTestResult = NonNullable<KeyConfig["lastTest"]>;
@@ -155,13 +170,52 @@ type CcSwitchAction = {
   tone?: "default" | "accent";
 };
 
-const STORAGE_KEY = "ai-key-vault-configs-v1";
-const LEGACY_STORAGE_KEYS = ["ai-key-vault-configs", "ai-key-check-configs-v1"];
-const INTRO_SEEN_KEY = "ai-key-vault-intro-seen-v1";
-const SOURCE_REPO_URL = "https://github.com/Yoan98/ai-key-manage";
+const THEME_STORAGE_KEY = "ai-key-vault-theme-v1";
+const CLIENT_ID_RANDOM_BYTE_COUNT = 16;
+const NOTICE_DURATION_MS = 3000;
+const NOTICE_ERROR_KEYWORDS = ["失败", "错误", "暂无", "没有", "不能为空", "未识别", "请先", "重试"];
+const NOTICE_SUCCESS_KEYWORDS = ["成功", "完成", "已", "通过"];
 const PASS_TEXT = "主人，快鞭策我吧";
 const FAIL_TEXT = "主人，我不行了";
 const DEFAULT_BENCHMARK_ROUNDS = 2;
+const API_FORMAT_OPTIONS: { value: OpenAIProxyApiFormat; label: string; hint: string }[] = [
+  { value: "auto", label: "自动兼容", hint: "优先 Chat Completions，必要时 fallback 到 Responses" },
+  { value: "chat", label: "/v1/chat/completions", hint: "OpenAI 兼容中转站最常见" },
+  { value: "responses", label: "/v1/responses", hint: "OpenAI Responses API" },
+  { value: "messages", label: "/v1/messages", hint: "Claude / Anthropic Messages 兼容格式" }
+];
+function normalizeApiFormat(input: unknown): OpenAIProxyApiFormat {
+  if (input === "chat" || input === "responses" || input === "messages" || input === "auto") return input;
+  return "auto";
+}
+type ModelCategory = "gpt" | "claude" | "glm" | "deepseek" | "gemini" | "grok" | "mimo" | "other";
+type ModelCategoryFilter = ModelCategory | "all";
+const MODEL_CATEGORY_RULES: { category: ModelCategory; patterns: RegExp[] }[] = [
+  { category: "gpt", patterns: [/\bgpt\b/i, /\bo1\b/i, /\bo3\b/i, /\bo4\b/i, /openai/i, /chatgpt/i] },
+  { category: "claude", patterns: [/claude/i, /anthropic/i] },
+  { category: "glm", patterns: [/\bglm\b/i, /chatglm/i, /zhipu/i] },
+  { category: "deepseek", patterns: [/deepseek/i] },
+  { category: "gemini", patterns: [/gemini/i] },
+  { category: "grok", patterns: [/grok/i, /\bxai\b/i] },
+  { category: "mimo", patterns: [/mimo/i] }
+];
+const MODEL_CATEGORY_OPTIONS: { value: ModelCategoryFilter; label: string }[] = [
+  { value: "all", label: "全部" },
+  { value: "gpt", label: "GPT" },
+  { value: "claude", label: "Claude" },
+  { value: "glm", label: "GLM" },
+  { value: "deepseek", label: "DeepSeek" },
+  { value: "gemini", label: "Gemini" },
+  { value: "grok", label: "Grok" },
+  { value: "mimo", label: "Mimo" },
+  { value: "other", label: "其他" }
+];
+function inferModelCategory(model: string): ModelCategory {
+  const m = model.trim();
+  if (!m) return "other";
+  const hit = MODEL_CATEGORY_RULES.find((r) => r.patterns.some((p) => p.test(m)));
+  return hit ? hit.category : "other";
+}
 const MODEL_TAG_RULES: { tag: string; patterns: RegExp[] }[] = [
   { tag: "image", patterns: [/\bimage\b/i, /\bvision\b/i, /\bvl\b/i, /\bflux\b/i, /\bsd(?:xl)?\b/i, /stable[- ]?diffusion/i] },
   { tag: "embedding", patterns: [/embedding/i, /\bembed\b/i, /text-embedding/i, /\bbge\b/i, /\bmxbai\b/i, /\be5\b/i] },
@@ -179,26 +233,70 @@ const CC_SWITCH_APPS: { value: CcSwitchApp; label: string }[] = [
   { value: "openclaw", label: "OpenClaw" }
 ];
 
-const labelClass = "mb-1.5 mt-2.5 block text-sm font-semibold text-zinc-700";
+const labelClass = "mb-1.5 mt-2.5 block text-sm font-semibold text-zinc-700 dark:text-zinc-200";
 const inputClass =
-  "w-full rounded-xl border border-zinc-300 bg-white px-3 py-2.5 text-sm text-zinc-900 outline-none transition focus:border-zinc-400 focus:ring-4 focus:ring-emerald-100";
+  "w-full rounded-xl border border-zinc-300 bg-white px-3 py-2.5 text-sm text-zinc-900 outline-none transition hover:border-zinc-400 focus:border-zinc-400 focus:ring-4 focus:ring-emerald-100 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 dark:hover:border-zinc-600 dark:focus:border-zinc-600 dark:focus:ring-emerald-900/40";
 const btnBase =
   "inline-flex shrink-0 items-center gap-2 whitespace-nowrap rounded-full border px-3.5 py-2 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-60";
-const btnPrimary = `${btnBase} border-emerald-700 bg-emerald-600 text-white hover:bg-emerald-700`;
-const btnGhost = `${btnBase} border-zinc-300 bg-white text-zinc-800 hover:bg-zinc-50 hover:border-zinc-400`;
+const btnPrimary = `${btnBase} border-transparent bg-gradient-to-br from-emerald-500 to-teal-600 text-white shadow-sm shadow-emerald-600/20 hover:from-emerald-600 hover:to-teal-700 dark:from-emerald-400 dark:to-teal-500 dark:text-emerald-950 dark:shadow-emerald-500/20`;
+const btnGhost = `${btnBase} border-zinc-300 bg-white text-zinc-800 hover:bg-zinc-50 hover:border-zinc-400 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800 dark:hover:border-zinc-600`;
 const topBtnBase =
   "inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full border px-3 py-1.5 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-60";
-const topBtnPrimary = `${topBtnBase} border-emerald-700 bg-emerald-600 text-white hover:bg-emerald-700`;
-const topBtnGhost = `${topBtnBase} border-zinc-300 bg-white text-zinc-800 hover:bg-zinc-50 hover:border-zinc-400`;
-const topBtnDanger = `${topBtnBase} border-red-200 bg-white text-red-500 hover:border-red-700 hover:bg-red-700 hover:text-white`;
+const topBtnPrimary = `${topBtnBase} border-transparent bg-gradient-to-br from-emerald-500 to-teal-600 text-white shadow-sm shadow-emerald-600/20 hover:from-emerald-600 hover:to-teal-700 dark:from-emerald-400 dark:to-teal-500 dark:text-emerald-950`;
+const topBtnGhost = `${topBtnBase} border-zinc-300 bg-white text-zinc-800 hover:bg-zinc-50 hover:border-zinc-400 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800 dark:hover:border-zinc-600`;
+const topBtnDanger = `${topBtnBase} border-red-200 bg-white text-red-500 hover:border-red-700 hover:bg-red-700 hover:text-white dark:border-red-900/60 dark:bg-zinc-900 dark:text-red-400 dark:hover:border-red-700`;
 const smallBtn =
-  "inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg border border-zinc-300 bg-white px-2.5 py-1.5 text-xs font-medium text-zinc-700 transition hover:border-zinc-400 hover:bg-zinc-50";
+  "inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg border border-zinc-300 bg-white px-2.5 py-1.5 text-xs font-medium text-zinc-700 transition hover:border-zinc-400 hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200 dark:hover:border-zinc-600 dark:hover:bg-zinc-700";
 const smallDangerBtn =
-  "inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg border border-red-200 bg-white px-2.5 py-1.5 text-xs font-medium text-red-600 transition hover:border-red-700 hover:bg-red-700 hover:text-white";
+  "inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg border border-red-200 bg-white px-2.5 py-1.5 text-xs font-medium text-red-600 transition hover:border-red-700 hover:bg-red-700 hover:text-white dark:border-red-900/60 dark:bg-zinc-800 dark:text-red-400";
 const iconCopyBtn =
-  "inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-zinc-400 transition hover:bg-zinc-100 hover:text-zinc-700 disabled:cursor-not-allowed disabled:opacity-45";
-const endpointHintText = "地址只填域名也可以，系统会自动兼容 /v1、/chat/completions、/responses；测试会兼容流式、普通响应和 Responses，并优先展示信息量更高的那份回复。";
+  "inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-zinc-400 transition hover:bg-zinc-100 hover:text-zinc-700 disabled:cursor-not-allowed disabled:opacity-45 dark:hover:bg-zinc-700 dark:hover:text-zinc-200";
+const endpointHintText = "地址只填域名也可以，系统会自动兼容 /v1、/chat/completions、/responses、/messages；API 格式可单独选择，自动兼容会优先 Chat Completions，再按需尝试 Responses。";
 const ReactECharts = dynamic(() => import("echarts-for-react"), { ssr: false });
+
+function createClientId(): string {
+  const webCrypto = globalThis.crypto;
+  if (typeof webCrypto?.randomUUID === "function") return webCrypto.randomUUID();
+
+  if (typeof webCrypto?.getRandomValues === "function") {
+    const randomBytes = webCrypto.getRandomValues(new Uint8Array(CLIENT_ID_RANDOM_BYTE_COUNT));
+    const randomPart = Array.from(randomBytes, (value) => value.toString(16).padStart(2, "0")).join("");
+    return `cfg-${Date.now().toString(36)}-${randomPart}`;
+  }
+
+  return `cfg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+function inferNoticeTone(message: string): NoticeTone {
+  if (message.startsWith("开始")) return "info";
+
+  const toneMessage = message.replaceAll("失败列表", "列表");
+  if (NOTICE_ERROR_KEYWORDS.some((keyword) => toneMessage.includes(keyword))) return "error";
+  if (NOTICE_SUCCESS_KEYWORDS.some((keyword) => toneMessage.includes(keyword))) return "success";
+  return "info";
+}
+
+function parseConfigTimestamp(value?: string): number | null {
+  if (!value) return null;
+
+  const timestamp = Date.parse(value);
+  return Number.isNaN(timestamp) ? null : timestamp;
+}
+
+function compareConfigsByTestedAtDesc(left: KeyConfig, right: KeyConfig): number {
+  const leftTestedAt = parseConfigTimestamp(left.lastTest?.testedAt);
+  const rightTestedAt = parseConfigTimestamp(right.lastTest?.testedAt);
+
+  if (leftTestedAt !== null || rightTestedAt !== null) {
+    if (leftTestedAt === null) return 1;
+    if (rightTestedAt === null) return -1;
+    if (leftTestedAt !== rightTestedAt) return rightTestedAt - leftTestedAt;
+  }
+
+  const leftCreatedAt = parseConfigTimestamp(left.createdAt) || 0;
+  const rightCreatedAt = parseConfigTimestamp(right.createdAt) || 0;
+  return rightCreatedAt - leftCreatedAt;
+}
 
 function normalizeBaseUrl(raw: string): string {
   const cleaned = raw.trim().replace(/\/+$/, "");
@@ -546,6 +644,7 @@ function finalizeParsed(items: Partial<ParsedConfig>[], startIndex: number): Par
       baseUrl: normalizeBaseUrl(item.baseUrl || ""),
       apiKey: cleanKey(item.apiKey || ""),
       model: (item.model || "").trim(),
+      apiFormat: normalizeApiFormat(item.apiFormat),
       sourceMeta: item.sourceMeta
     }))
     .filter((item) => item.baseUrl || item.apiKey || item.model);
@@ -554,7 +653,7 @@ function finalizeParsed(items: Partial<ParsedConfig>[], startIndex: number): Par
   const seen = new Set<string>();
 
   for (const item of cleaned) {
-    const key = `${item.baseUrl}__${item.apiKey}__${item.model}`;
+    const key = `${item.baseUrl}__${item.apiKey}__${item.model}__${item.apiFormat}`;
     if (seen.has(key)) continue;
     seen.add(key);
     deduped.push(item);
@@ -568,11 +667,13 @@ function finalizeParsed(items: Partial<ParsedConfig>[], startIndex: number): Par
 
 function createKeyConfigsFromParsed(items: ParsedConfig[]): KeyConfig[] {
   return items.map((item) => ({
-    id: crypto.randomUUID(),
+    id: createClientId(),
     name: item.name,
     baseUrl: item.baseUrl,
     apiKey: item.apiKey,
     model: item.model,
+    apiFormat: item.apiFormat || "auto",
+    listStatus: "success",
     createdAt: new Date().toISOString(),
     sourceMeta: item.sourceMeta || { kind: "manual" }
   }));
@@ -722,6 +823,7 @@ function formatConfig(item: KeyConfig, type: ExportType): string {
       `- 地址: ${item.baseUrl}`,
       `- Key: ${item.apiKey}`,
       `- 模型: ${item.model || "(未设置)"}`,
+      `- API 格式: ${API_FORMAT_OPTIONS.find((option) => option.value === (item.apiFormat || "auto"))?.label || "自动兼容"}`,
       `- 创建时间: ${item.createdAt}`,
       ""
     ].join("\n");
@@ -731,6 +833,7 @@ function formatConfig(item: KeyConfig, type: ExportType): string {
     `地址: ${item.baseUrl}`,
     `Key: ${item.apiKey}`,
     `模型: ${item.model || "(未设置)"}`,
+    `API 格式: ${API_FORMAT_OPTIONS.find((option) => option.value === (item.apiFormat || "auto"))?.label || "自动兼容"}`,
     `创建时间: ${item.createdAt}`,
     ""
   ].join("\n");
@@ -870,7 +973,10 @@ function normalizeFinishedTestResult(input: unknown): FinishedTestResult | undef
     typeof input.responseText === "string" && input.responseText.trim() ? input.responseText : legacyResponseText;
   const responseText = responseTextSource ? cleanMultilineText(responseTextSource, 2000) : "";
   const responseSource =
-    input.responseSource === "stream" || input.responseSource === "chat" || input.responseSource === "responses"
+    input.responseSource === "stream" ||
+    input.responseSource === "chat" ||
+    input.responseSource === "responses" ||
+    input.responseSource === "messages"
       ? input.responseSource
       : undefined;
   const detail = rawDetail && !legacyResponseText ? cleanOneLineText(rawDetail, 300) : responseText ? "接口连通，已收到模型回复" : "";
@@ -1220,13 +1326,6 @@ function defaultProbeResult(): ProbeResult {
   return { status: "idle", supportedModels: [] };
 }
 
-function getSourceBadge(meta?: KeyConfig["sourceMeta"]): string {
-  if (!meta) return "手动";
-  if (meta.kind === "cc-switch-deeplink") return "CC Switch 链接";
-  if (meta.kind === "cc-switch-provider") return "CC Switch 配置";
-  return "手动";
-}
-
 async function fetchJsonWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<unknown> {
   const controller = new AbortController();
   const timer = window.setTimeout(() => controller.abort(), timeoutMs);
@@ -1358,7 +1457,7 @@ function makeErrorDetail(error: unknown): string {
 function normalizeStoredConfigItem(input: unknown, index: number): KeyConfig | undefined {
   if (!isRecord(input)) return undefined;
 
-  const id = typeof input.id === "string" && input.id ? input.id : crypto.randomUUID();
+  const id = typeof input.id === "string" && input.id ? input.id : createClientId();
   const rawName = firstNonEmptyString(input.name, input.title, input.label);
   const baseUrl = normalizeBaseUrl(
     firstNonEmptyString(input.baseUrl, input.baseURL, input.url, input.endpoint, input.apiBaseUrl, input.api_url)
@@ -1370,12 +1469,22 @@ function normalizeStoredConfigItem(input: unknown, index: number): KeyConfig | u
   const probe = normalizeFinishedProbeResult(input.probe || input.probeResult || input.modelProbe);
   const lastTest = normalizeFinishedTestResult(input.lastTest || input.lastResult || input.testResult);
   const benchmarks = normalizeStoredBenchmarks(input.benchmarks || input.modelBenchmarks || input.benchmarkResults);
+  const apiFormat = normalizeApiFormat(input.apiFormat || input.api_format || input.format || input.endpointFormat);
+  const rawListStatus = input.listStatus || input.list_status || input.groupStatus;
+  const listStatus: KeyConfig["listStatus"] =
+    rawListStatus === "failed" || rawListStatus === "error"
+      ? "failed"
+      : rawListStatus === "success"
+        ? "success"
+        : lastTest?.status === "error"
+          ? "failed"
+          : "success";
   const hasCoreValue = Boolean(rawName || baseUrl || apiKey || model || probe || lastTest || benchmarks);
 
   if (!hasCoreValue) return undefined;
 
   const name = rawName || makeDefaultName(index + 1);
-  return { id, name, baseUrl, apiKey, model, createdAt, sourceMeta, probe, lastTest, benchmarks };
+  return { id, name, baseUrl, apiKey, model, apiFormat, listStatus, createdAt, sourceMeta, probe, lastTest, benchmarks };
 }
 
 function toStoredConfigCandidates(parsed: unknown): unknown[] {
@@ -1404,26 +1513,6 @@ function normalizeStoredConfigs(raw: string): KeyConfig[] {
   return normalized;
 }
 
-function loadConfigsFromStorage(storage: Storage): { configs: KeyConfig[]; sourceKey?: string } {
-  const candidateKeys = [STORAGE_KEY, ...LEGACY_STORAGE_KEYS];
-
-  for (const key of candidateKeys) {
-    const raw = storage.getItem(key);
-    if (!raw) continue;
-
-    try {
-      const configs = normalizeStoredConfigs(raw);
-      if (configs.length > 0) {
-        return { configs, sourceKey: key };
-      }
-    } catch {
-      continue;
-    }
-  }
-
-  return { configs: [] };
-}
-
 function defaultTestResult(): TestResult {
   return { status: "idle", message: "未测试" };
 }
@@ -1431,6 +1520,7 @@ function defaultTestResult(): TestResult {
 function testResponseSourceLabel(source?: TestResult["responseSource"]): string {
   if (source === "stream") return "流式";
   if (source === "responses") return "Responses";
+  if (source === "messages") return "Messages";
   if (source === "chat") return "普通";
   return "";
 }
@@ -1469,19 +1559,22 @@ function HelpHint({ text }: { text: string }) {
 
 export default function Home() {
   const ccSwitchSqlInputRef = useRef<HTMLInputElement | null>(null);
+  const configWriteQueueRef = useRef<Promise<void>>(Promise.resolve());
   const [configs, setConfigs] = useState<KeyConfig[]>([]);
-  const [form, setForm] = useState<FormState>({ name: "", baseUrl: "", apiKey: "", model: "" });
+  const [isConfigStoreReady, setIsConfigStoreReady] = useState(false);
+  const [configStoreError, setConfigStoreError] = useState("");
+  const [form, setForm] = useState<FormState>({ name: "", baseUrl: "", apiKey: "", model: "", apiFormat: "auto" });
   const [formSourceMeta, setFormSourceMeta] = useState<KeyConfig["sourceMeta"]>();
   const [pasteRaw, setPasteRaw] = useState("");
   const [loadingMap, setLoadingMap] = useState<Record<string, boolean>>({});
   const [resultMap, setResultMap] = useState<Record<string, TestResult>>({});
   const [probeMap, setProbeMap] = useState<Record<string, ProbeResult>>({});
   const [benchmarkMap, setBenchmarkMap] = useState<Record<string, Record<string, ModelBenchmarkResult>>>({});
-  const [notice, setNotice] = useState("");
+  const [notice, setNoticeState] = useState<NoticeState | null>(null);
   const [testingAll, setTestingAll] = useState(false);
   const [probingAll, setProbingAll] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [editForm, setEditForm] = useState<FormState>({ name: "", baseUrl: "", apiKey: "", model: "" });
+  const [editForm, setEditForm] = useState<FormState>({ name: "", baseUrl: "", apiKey: "", model: "", apiFormat: "auto" });
   const [editingModelId, setEditingModelId] = useState<string | null>(null);
   const [modelDraft, setModelDraft] = useState("");
   const [ccSwitchDialogId, setCcSwitchDialogId] = useState<string | null>(null);
@@ -1496,33 +1589,762 @@ export default function Home() {
   const [benchmarkChartModel, setBenchmarkChartModel] = useState("");
   const [benchmarkListCollapsed, setBenchmarkListCollapsed] = useState(false);
   const [benchmarkDetailModel, setBenchmarkDetailModel] = useState("");
-  const [introExpanded, setIntroExpanded] = useState(false);
+  const [theme, setTheme] = useState<ThemeMode>("system");
+  const [collapsedIds, setCollapsedIds] = useState<Record<string, boolean>>({});
+  const [categoryFilter, setCategoryFilter] = useState<ModelCategoryFilter>("all");
+  const [configSearch, setConfigSearch] = useState("");
+  const [searchDropdownOpen, setSearchDropdownOpen] = useState(false);
+  const searchBoxRef = useRef<HTMLDivElement | null>(null);
+  const [highlightedConfigId, setHighlightedConfigId] = useState<string | null>(null);
+  const [probeModelCategory, setProbeModelCategory] = useState<ModelCategoryFilter>("all");
+  const cardItemRefs = useRef<Record<string, HTMLLIElement | null>>({});
+
+  function setNotice(message: string, tone?: NoticeTone) {
+    if (!message) {
+      setNoticeState(null);
+      return;
+    }
+
+    setNoticeState({ message, tone: tone || inferNoticeTone(message) });
+  }
 
   useEffect(() => {
-    const { configs: restoredConfigs, sourceKey } = loadConfigsFromStorage(localStorage);
-    if (restoredConfigs.length === 0) return;
+    let cancelled = false;
 
-    setConfigs(restoredConfigs);
-    if (sourceKey && sourceKey !== STORAGE_KEY) {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(restoredConfigs));
+    async function loadProjectConfigs() {
+      try {
+        const response = await fetch("/api/configs", { cache: "no-store" });
+        if (!response.ok) throw new Error("读取项目配置失败");
+
+        const payload: unknown = await response.json();
+        const storedConfigs =
+          typeof payload === "object" && payload !== null && "configs" in payload
+            ? (payload as { configs: unknown }).configs
+            : [];
+
+        if (!cancelled) {
+          setConfigs(normalizeStoredConfigs(JSON.stringify(storedConfigs)));
+          setIsConfigStoreReady(true);
+          setConfigStoreError("");
+        }
+      } catch {
+        if (!cancelled) {
+          const errorMessage = "读取项目配置失败，请刷新页面重试";
+          setConfigStoreError(errorMessage);
+          setNotice(errorMessage);
+        }
+      }
     }
+
+    void loadProjectConfigs();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(configs));
-  }, [configs]);
+    if (!isConfigStoreReady) return;
 
+    configWriteQueueRef.current = configWriteQueueRef.current
+      .catch(() => undefined)
+      .then(async () => {
+        const response = await fetch("/api/configs", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ configs })
+        });
+        if (!response.ok) throw new Error("保存项目配置失败");
+      })
+      .catch(() => {
+        const errorMessage = "保存项目配置失败，请检查服务状态后重试";
+        setConfigStoreError(errorMessage);
+        setNotice(errorMessage);
+      });
+  }, [configs, isConfigStoreReady]);
+
+  // 主题初始化：读取本地存储，否则默认跟随系统。
   useEffect(() => {
-    const seen = localStorage.getItem(INTRO_SEEN_KEY) === "1";
-    setIntroExpanded(!seen);
-    if (!seen) {
-      localStorage.setItem(INTRO_SEEN_KEY, "1");
-    }
+    const stored = localStorage.getItem(THEME_STORAGE_KEY);
+    const normalized: ThemeMode =
+      stored === "light" || stored === "dark" || stored === "system" ? stored : "system";
+    setTheme(normalized);
   }, []);
+
+  // 搜索下拉：点击外部或按 Esc 关闭候选列表。
+  useEffect(() => {
+    if (!searchDropdownOpen) return;
+
+    function handlePointerDown(event: MouseEvent) {
+      if (!searchBoxRef.current?.contains(event.target as Node)) {
+        setSearchDropdownOpen(false);
+      }
+    }
+
+    function handleEscape(event: KeyboardEvent) {
+      if (event.key === "Escape") setSearchDropdownOpen(false);
+    }
+
+    document.addEventListener("mousedown", handlePointerDown);
+    document.addEventListener("keydown", handleEscape);
+    return () => {
+      document.removeEventListener("mousedown", handlePointerDown);
+      document.removeEventListener("keydown", handleEscape);
+    };
+  }, [searchDropdownOpen]);
+
+  // 主题应用 + 监听系统主题变化（仅 system 模式生效）。
+  useEffect(() => {
+    const root = document.documentElement;
+
+    const apply = (mode: ThemeMode) => {
+      const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+      const isDark = mode === "dark" || (mode === "system" && prefersDark);
+      root.classList.toggle("dark", isDark);
+      root.style.colorScheme = isDark ? "dark" : "light";
+    };
+
+    apply(theme);
+
+    if (theme !== "system") return undefined;
+
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const handler = () => apply(theme);
+    media.addEventListener("change", handler);
+    return () => media.removeEventListener("change", handler);
+  }, [theme]);
+
+  function setThemeMode(mode: ThemeMode) {
+    setTheme(mode);
+    try {
+      localStorage.setItem(THEME_STORAGE_KEY, mode);
+    } catch {
+      // 忽略隐身模式等写入失败。
+    }
+  }
+
+  // 卡片折叠/展开：默认折叠（未在 collapsedIds 中即视为折叠）
+  function isConfigCollapsed(id: string) {
+    return collapsedIds[id] !== false;
+  }
+
+  function toggleCollapse(id: string) {
+    setCollapsedIds((prev) => ({ ...prev, [id]: prev[id] !== false ? false : true }));
+  }
+
+  // 卡片展示状态取运行时结果；列表归属使用持久 listStatus，避免测试中/编辑时在成功与失败列表之间跳动
+  function getConfigResult(item: KeyConfig): TestResult {
+    return resultMap[item.id] || item.lastTest || defaultTestResult();
+  }
+  function getConfigListStatus(item: KeyConfig): "success" | "failed" {
+    return item.listStatus || (item.lastTest?.status === "error" ? "failed" : "success");
+  }
+  const sortedConfigs = [...configs].sort(compareConfigsByTestedAtDesc);
+  const failedConfigs = sortedConfigs.filter((item) => getConfigListStatus(item) === "failed");
+  const visibleConfigs = sortedConfigs.filter((item) => getConfigListStatus(item) === "success");
+
+  // 折叠/展开全部 的控制范围跟随当前激活的列表
+  const [activeList, setActiveList] = useState<"all" | "failed">("all");
+  const baseActiveConfigs = activeList === "failed" ? failedConfigs : visibleConfigs;
+  // 按模型分类过滤（与失败/配置列表切换叠加）
+  const activeConfigs = baseActiveConfigs.filter(
+    (item) => categoryFilter === "all" || inferModelCategory(item.model) === categoryFilter
+  );
+  const activeCount = activeConfigs.length;
+  const activeCollapsedCount = activeConfigs.filter((item) => isConfigCollapsed(item.id)).length;
+  const activeAllCollapsed = activeCount > 0 && activeCollapsedCount === activeCount;
+
+  // 搜索匹配：按名称模糊匹配，最多展示 8 条候选
+  const searchMatches = useMemo(() => {
+    const query = configSearch.trim().toLowerCase();
+    if (!query) return [];
+    return sortedConfigs.filter((item) => item.name.toLowerCase().includes(query)).slice(0, 8);
+  }, [configSearch, sortedConfigs]);
+
+  // 搜索定位：切到目标所在列表并高亮、展开，再滚动到对应卡片
+  function locateConfigTarget(target: KeyConfig) {
+    setActiveList(getConfigListStatus(target) === "failed" ? "failed" : "all");
+    setCategoryFilter("all");
+    setConfigSearch(target.name);
+    setCollapsedIds((prev) => ({ ...prev, [target.id]: false }));
+    setHighlightedConfigId(target.id);
+    setSearchDropdownOpen(false);
+
+    // 等列表切换 / 展开渲染完成后再滚动；多帧重试避免 ref 尚未挂载
+    const scrollToCard = (attempt: number) => {
+      const el = cardItemRefs.current[target.id];
+      if (el) {
+        el.scrollIntoView({ block: "center", behavior: "smooth" });
+        return;
+      }
+      if (attempt < 8) {
+        window.setTimeout(() => scrollToCard(attempt + 1), 50);
+      }
+    };
+    window.setTimeout(() => scrollToCard(0), 50);
+
+    window.setTimeout(() => {
+      setHighlightedConfigId((cur) => (cur === target.id ? null : cur));
+    }, 2200);
+  }
+
+  // 回车/点击「定位」：跳到首个匹配项
+  function locateConfig() {
+    const target = searchMatches[0];
+    if (!target) return;
+    locateConfigTarget(target);
+  }
+
+  function revealSavedConfig(id: string) {
+    setActiveList("all");
+    setCategoryFilter("all");
+    setConfigSearch("");
+    setCollapsedIds((prev) => ({ ...prev, [id]: false }));
+    setHighlightedConfigId(id);
+
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        cardItemRefs.current[id]?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      });
+    });
+    setTimeout(() => {
+      setHighlightedConfigId((currentId) => (currentId === id ? null : currentId));
+    }, 2200);
+  }
+
+  function collapseActiveAll() {
+    setCollapsedIds((prev) => ({ ...prev, ...Object.fromEntries(activeConfigs.map((item) => [item.id, true])) }));
+  }
+
+  function expandActiveAll() {
+    setCollapsedIds((prev) => ({ ...prev, ...Object.fromEntries(activeConfigs.map((item) => [item.id, false])) }));
+  }
+
+  // 共享卡片渲染：配置列表与失败列表共用同一函数，折叠/小框设计一致复用
+  function renderConfigCard(item: KeyConfig) {
+    const testing = loadingMap[item.id];
+    const result = getConfigResult(item);
+    const probe = probeMap[item.id] || item.probe || defaultProbeResult();
+    const isEditing = editingId === item.id;
+    const isEditingModel = editingModelId === item.id;
+    const isCollapsed = !isEditing && isConfigCollapsed(item.id);
+    const probing = probe.status === "pending";
+    const currentModelTags = inferModelTags(item.model);
+    const runtimeBenchmarks = benchmarkMap[item.id] || {};
+    const currentBenchmark =
+      item.model.trim() ? runtimeBenchmarks[item.model] || item.benchmarks?.[item.model] || defaultModelBenchmarkResult(item.model) : null;
+    const finishedBenchmarks = collectFinishedBenchmarks(item, runtimeBenchmarks);
+    const fastestBenchmark = pickFastestBenchmark(finishedBenchmarks);
+    const quickestFirstTokenBenchmark = pickQuickestFirstTokenBenchmark(finishedBenchmarks);
+    const recommendedBenchmark = pickRecommendedBenchmark(finishedBenchmarks);
+
+    return (
+      <li
+        key={item.id}
+        data-config-id={item.id}
+        ref={(el) => {
+          cardItemRefs.current[item.id] = el;
+        }}
+        className={`w-full min-w-0 rounded-2xl border bg-white p-2.5 transition dark:bg-zinc-900 ${
+          highlightedConfigId === item.id
+            ? "border-emerald-400 ring-2 ring-emerald-300 dark:border-emerald-500 dark:ring-emerald-500/60"
+            : "border-zinc-200 dark:border-zinc-700"
+        }`}
+      >
+        {isEditing ? (
+          <div className="rounded-xl border border-dashed border-zinc-300 p-3">
+            <label className={labelClass}>名称</label>
+            <input
+              className={inputClass}
+              value={editForm.name}
+              onChange={(e) => setEditForm((prev) => ({ ...prev, name: e.target.value }))}
+            />
+
+            <label className={labelClass}>地址</label>
+            <input
+              className={inputClass}
+              value={editForm.baseUrl}
+              onChange={(e) => setEditForm((prev) => ({ ...prev, baseUrl: e.target.value }))}
+              placeholder="例如：https://api.openai.com"
+            />
+            <p className="mt-1 text-[11px] leading-5 text-zinc-500">{endpointHintText}</p>
+
+            <label className={labelClass}>Key</label>
+            <input
+              className={inputClass}
+              value={editForm.apiKey}
+              onChange={(e) => setEditForm((prev) => ({ ...prev, apiKey: e.target.value }))}
+            />
+
+            <label className={labelClass}>模型</label>
+            <input
+              className={inputClass}
+              value={editForm.model}
+              onChange={(e) => setEditForm((prev) => ({ ...prev, model: e.target.value }))}
+            />
+
+            <label className={labelClass}>API 格式</label>
+            <select
+              className={inputClass}
+              value={editForm.apiFormat}
+              onChange={(e) => setEditForm((prev) => ({ ...prev, apiFormat: normalizeApiFormat(e.target.value) }))}
+            >
+              {API_FORMAT_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>{`${option.label} - ${option.hint}`}</option>
+              ))}
+            </select>
+
+            <div className="mt-2 flex flex-wrap gap-2">
+              <button type="button" className={btnPrimary} onClick={() => saveEdit(item.id)}>
+                <FaSave aria-hidden />
+                <span>保存编辑</span>
+              </button>
+              <button type="button" className={btnGhost} onClick={cancelEdit}>
+                <FaTimesCircle aria-hidden />
+                <span>取消</span>
+              </button>
+            </div>
+          </div>
+        ) : (
+          <>
+            <div className="flex items-center gap-2">
+              <div
+                className="group/card flex min-w-0 flex-1 items-center gap-2 rounded-lg px-1.5 py-1 -mx-1.5 -my-1 cursor-pointer outline-none transition hover:bg-zinc-50/70 focus-visible:ring-2 focus-visible:ring-emerald-300 dark:hover:bg-zinc-800/40"
+              onClick={() => toggleCollapse(item.id)}
+              role="button"
+              tabIndex={0}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  toggleCollapse(item.id);
+                }
+              }}
+              aria-expanded={!isCollapsed}
+              aria-label={isCollapsed ? "展开卡片" : "折叠卡片"}
+              title={isCollapsed ? "点击展开" : "点击折叠"}
+            >
+              <span className="inline-flex h-5 w-5 shrink-0 items-center justify-center text-zinc-400 transition-transform duration-200 group-hover/card:text-emerald-600 dark:text-zinc-500 dark:group-hover/card:text-emerald-400">
+                <span className={`transition-transform duration-200 ${isCollapsed ? "" : "rotate-180"}`}>
+                  <FaChevronDown aria-hidden />
+                </span>
+              </span>
+              <div className="min-w-0 max-w-[min(42vw,22rem)] truncate text-base font-bold text-zinc-900 dark:text-zinc-100">{item.name}</div>
+              <span
+                className={`inline-flex shrink-0 items-center gap-1 rounded-full px-2.5 py-1 text-xs font-semibold ${statusPillClass(result.status)}`}
+                title={result.message}
+              >
+                <StatusIcon status={result.status} />
+                <span className="max-w-[10rem] truncate">{result.message}</span>
+              </span>
+              </div>
+              {isCollapsed ? (
+                <div className="ml-auto flex shrink-0 items-center gap-1.5">
+                  <button
+                    type="button"
+                    className={smallBtn}
+                    onClick={() => testConfig(item)}
+                    disabled={testing}
+                    title="测试"
+                    aria-label="测试"
+                  >
+                    {testing ? <FaSpinner className="animate-spin" aria-hidden /> : <FaBolt aria-hidden />}
+                    <span>测试</span>
+                  </button>
+                  <button
+                    type="button"
+                    className={smallBtn}
+                    onClick={() => probeConfig(item)}
+                    disabled={probing}
+                    title="识别模型"
+                    aria-label="识别模型"
+                  >
+                    {probing ? <FaSpinner className="animate-spin" aria-hidden /> : <FaMagic aria-hidden />}
+                    <span>识别模型</span>
+                  </button>
+                  <button
+                    type="button"
+                    className={smallBtn}
+                    onClick={() => startEdit(item)}
+                    title="编辑"
+                    aria-label="编辑"
+                  >
+                    <FaEdit aria-hidden />
+                    <span>编辑</span>
+                  </button>
+                  <button
+                    type="button"
+                    className={smallDangerBtn}
+                    onClick={() => removeConfig(item.id)}
+                    title="删除"
+                    aria-label="删除"
+                  >
+                    <FaTrashAlt aria-hidden />
+                    <span>删除</span>
+                  </button>
+                </div>
+              ) : null}
+            </div>
+
+            {isCollapsed ? (
+              <div className="mt-1 flex min-w-0 items-center gap-2">
+                {/* 模型 + 返回内容 + 操作按钮（单行） */}
+                <span
+                  className="inline-flex min-w-0 max-w-[42vw] shrink items-center gap-1 truncate rounded-lg border border-zinc-200 bg-zinc-50 px-2 py-1 text-xs font-medium text-zinc-700 dark:border-zinc-700 dark:bg-zinc-800/60 dark:text-zinc-200"
+                  title={item.model || "（未设置）"}
+                >
+                  <FaTag className="shrink-0 text-zinc-400 dark:text-zinc-500" aria-hidden />
+                  <span className="truncate">{item.model || "（未设置）"}</span>
+                </span>
+                {result.detail ? (
+                  <span
+                    className="inline-flex min-w-0 flex-1 items-center gap-1 truncate rounded-lg border border-zinc-200 bg-zinc-50 px-2 py-1 text-xs text-zinc-600 dark:border-zinc-700 dark:bg-zinc-800/60 dark:text-zinc-300"
+                    title={cleanOneLineText(result.detail, 300)}
+                  >
+                    <FaInfoCircle className="shrink-0 text-zinc-400 dark:text-zinc-500" aria-hidden />
+                    <span className="truncate">{cleanOneLineText(result.detail, 120)}</span>
+                  </span>
+                ) : null}
+              </div>
+            ) : (
+              <>
+                <div className="mt-2 grid gap-2">
+                  <div className="grid gap-1 sm:grid-cols-[90px_1fr] sm:items-start sm:gap-2">
+                    <span className="inline-flex items-center gap-1 text-xs text-zinc-500">
+                      <FaLink aria-hidden /> 地址
+                    </span>
+                    <div className="flex min-w-0 max-w-full items-start gap-1.5">
+                      <button
+                        type="button"
+                        className="min-w-0 flex-1 break-all rounded-md px-1 py-0.5 text-left text-sm text-zinc-800 transition hover:bg-zinc-100 hover:text-emerald-700 disabled:cursor-default disabled:hover:bg-transparent disabled:hover:text-zinc-800 dark:text-zinc-100 dark:hover:bg-zinc-800 dark:hover:text-emerald-300 dark:disabled:hover:text-zinc-100"
+                        onClick={() => void copyText(item.baseUrl, `已复制地址：${item.name}`)}
+                        title={item.baseUrl ? "点击复制地址" : "未填写地址"}
+                        disabled={!item.baseUrl}
+                      >
+                        {item.baseUrl || "(未填写)"}
+                      </button>
+                      <button
+                        type="button"
+                        className={iconCopyBtn}
+                        onClick={() => void copyText(item.baseUrl, `已复制地址：${item.name}`)}
+                        title="复制地址"
+                        aria-label="复制地址"
+                        disabled={!item.baseUrl}
+                      >
+                        <FaCopy aria-hidden />
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="grid gap-1 sm:grid-cols-[90px_1fr] sm:items-start sm:gap-2">
+                    <span className="inline-flex items-center gap-1 text-xs text-zinc-500">
+                      <FaKey aria-hidden /> Key
+                    </span>
+                    <div className="flex min-w-0 max-w-full items-start gap-1.5">
+                      <button
+                        type="button"
+                        className="min-w-0 flex-1 break-all rounded-md px-1 py-0.5 text-left font-mono text-sm text-zinc-800 transition hover:bg-zinc-100 hover:text-emerald-700 disabled:cursor-default disabled:hover:bg-transparent disabled:hover:text-zinc-800 dark:text-zinc-100 dark:hover:bg-zinc-800 dark:hover:text-emerald-300 dark:disabled:hover:text-zinc-100"
+                        onClick={() => void copyText(item.apiKey, `已复制 Key：${item.name}`)}
+                        title={item.apiKey ? "点击复制 Key" : "未填写 Key"}
+                        disabled={!item.apiKey}
+                      >
+                        {item.apiKey ? toMaskedKey(item.apiKey) : "(未填写)"}
+                      </button>
+                      <button
+                        type="button"
+                        className={iconCopyBtn}
+                        onClick={() => void copyText(item.apiKey, `已复制 Key：${item.name}`)}
+                        title="复制 Key"
+                        aria-label="复制 Key"
+                        disabled={!item.apiKey}
+                      >
+                        <FaCopy aria-hidden />
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="grid gap-1 sm:grid-cols-[90px_1fr] sm:items-start sm:gap-2">
+                    <span className="inline-flex items-center gap-1 text-xs text-zinc-500">
+                      <FaTag aria-hidden /> 模型
+                    </span>
+                    <div className="grid gap-1.5">
+                      {isEditingModel ? (
+                        <input
+                          autoFocus
+                          className={inputClass}
+                          value={modelDraft}
+                          onChange={(e) => setModelDraft(e.target.value)}
+                          onBlur={() => saveInlineModelEdit(item.id)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                              e.preventDefault();
+                              saveInlineModelEdit(item.id);
+                            }
+                            if (e.key === "Escape") {
+                              e.preventDefault();
+                              cancelInlineModelEdit();
+                            }
+                          }}
+                          placeholder="点击后可修改"
+                        />
+                      ) : (
+                        <button
+                          type="button"
+                          className="inline-flex w-fit rounded-md border border-zinc-200 px-2 py-1 text-sm text-zinc-700 hover:bg-zinc-50"
+                          onClick={() => startInlineModelEdit(item)}
+                          title="点击编辑模型"
+                          aria-label="点击编辑模型"
+                        >
+                          {item.model || "点击设置模型"}
+                        </button>
+                      )}
+                      {currentModelTags.length > 0 ? (
+                        <div className="flex flex-wrap gap-1.5">
+                          {currentModelTags.map((tag) => (
+                            <span
+                              key={`${item.id}-${tag}`}
+                              className={`rounded-full border px-2 py-0.5 text-[11px] font-medium uppercase tracking-[0.08em] ${getTagClassName(tag)}`}
+                            >
+                              {tag}
+                            </span>
+                          ))}
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+
+                  <div className="grid gap-1 sm:grid-cols-[90px_1fr] sm:items-start sm:gap-2">
+                    <span className="inline-flex items-center gap-1 text-xs text-zinc-500">
+                      <FaVial aria-hidden /> API 格式
+                    </span>
+                    <select
+                      className={`${inputClass} max-w-md`}
+                      value={item.apiFormat || "auto"}
+                      onChange={(e) => updateConfigApiFormat(item.id, normalizeApiFormat(e.target.value))}
+                    >
+                      {API_FORMAT_OPTIONS.map((option) => (
+                        <option key={option.value} value={option.value}>{`${option.label} - ${option.hint}`}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="grid gap-1 sm:grid-cols-[90px_1fr] sm:items-start sm:gap-2">
+                    <span className="inline-flex items-center gap-1 text-xs text-zinc-500">
+                      <FaVial aria-hidden /> 状态
+                    </span>
+                    <div className="grid gap-1">
+                      <span
+                        className={`inline-flex w-fit items-center gap-1 rounded-full px-3 py-1 text-xs font-semibold ${statusPillClass(result.status)}`}
+                      >
+                        <StatusIcon status={result.status} />
+                        <span>{result.message}</span>
+                      </span>
+                      {result.status === "error" && result.detail ? (
+                        <details className="w-full rounded-lg border border-red-100 bg-red-50/50 px-2 py-1.5 text-xs text-red-800">
+                          <summary className="cursor-pointer font-medium text-red-700">有错误，点击查看详情</summary>
+                          <div className="mt-1 whitespace-pre-wrap break-words leading-5">{result.detail}</div>
+                        </details>
+                      ) : result.detail ? (
+                        <span className="text-xs text-zinc-500">{result.detail}</span>
+                      ) : null}
+                      {result.responseText ? (
+                        <div className="rounded-xl border border-emerald-200 bg-emerald-50/80 p-3">
+                          <div className="mb-1 flex flex-wrap items-center gap-2">
+                            <div className="text-[11px] font-semibold uppercase tracking-[0.12em] text-emerald-700">
+                              AI 返回内容
+                            </div>
+                            {result.responseSource ? (
+                              <span className="rounded-full border border-emerald-300 bg-white/70 px-2 py-0.5 text-[10px] font-medium text-emerald-700">
+                                来源：{testResponseSourceLabel(result.responseSource)}
+                              </span>
+                            ) : null}
+                          </div>
+                          <div className="whitespace-pre-wrap break-words text-xs leading-5 text-emerald-950">
+                            {result.responseText}
+                          </div>
+                        </div>
+                      ) : null}
+                      {item.lastTest?.testedAt ? (
+                        <span className="text-xs text-zinc-500">
+                          上次测试：{toDateTimeLabel(item.lastTest.testedAt)}（
+                          {item.lastTest.status === "success" ? "通过" : "失败"}）
+                        </span>
+                      ) : null}
+                    </div>
+                  </div>
+
+                  <div className="grid gap-1 sm:grid-cols-[90px_1fr] sm:items-start sm:gap-2">
+                    <span className="inline-flex items-center gap-1 text-xs text-zinc-500">
+                      <FaMagic aria-hidden /> 模型识别
+                      <HelpHint text="读取这组地址和 Key 可见的模型列表，帮助你先知道有哪些模型可以选。" />
+                    </span>
+                    <div className="grid gap-1">
+                      <span
+                        className={`inline-flex w-fit items-center gap-1 rounded-full px-3 py-1 text-xs font-semibold ${statusPillClass(probe.status)}`}
+                      >
+                        <StatusIcon status={probe.status} />
+                        <span>
+                          {probe.status === "idle"
+                            ? "未识别"
+                            : probe.status === "pending"
+                              ? "识别中..."
+                              : probe.status === "success"
+                                ? "识别成功"
+                                : "识别失败"}
+                        </span>
+                      </span>
+                      {probe.recommendedModel ? (
+                        <span className="text-xs text-zinc-600">推荐模型：{probe.recommendedModel}</span>
+                      ) : null}
+                      {probe.supportedModels.length > 0 ? (
+                        <button
+                          type="button"
+                          className="inline-flex w-fit items-center gap-1 rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-xs font-medium text-emerald-800 hover:bg-emerald-100"
+                          onClick={() => openProbeDialog(item)}
+                        >
+                          <FaMagic aria-hidden />
+                          <span>查看 {probe.supportedModels.length} 个模型</span>
+                        </button>
+                      ) : null}
+                      {probe.detail ? <span className="text-xs text-zinc-500">{probe.detail}</span> : null}
+                      {probe.testedAt ? (
+                        <span className="text-xs text-zinc-500">最近识别：{toDateTimeLabel(probe.testedAt)}</span>
+                      ) : null}
+                    </div>
+                  </div>
+
+                  <div className="grid gap-1 sm:grid-cols-[90px_1fr] sm:items-start sm:gap-2">
+                    <span className="inline-flex items-center gap-1 text-xs text-zinc-500">
+                      <FaBolt aria-hidden /> 性能评测
+                      <HelpHint text="对已识别到的模型做响应速度测试，帮你挑一个更适合日常使用的默认模型。" />
+                    </span>
+                    <div className="grid min-w-0 gap-1.5">
+                      <span
+                        className={`inline-flex w-fit items-center gap-1 rounded-full px-3 py-1 text-xs font-semibold ${
+                          currentBenchmark ? statusPillClass(currentBenchmark.status) : statusPillClass("idle")
+                        }`}
+                      >
+                        <StatusIcon status={currentBenchmark?.status || "idle"} />
+                        <span>{currentBenchmark ? benchmarkStatusLabel(currentBenchmark) : "未测试"}</span>
+                      </span>
+                      {currentBenchmark?.speed?.medianMs ? (
+                        <span className="break-all text-xs leading-5 text-zinc-600">
+                          当前中位：{formatDurationLabel(currentBenchmark.speed.medianMs)}
+                        </span>
+                      ) : null}
+                      {currentBenchmark?.speed?.firstTokenMedianMs ? (
+                        <span className="break-all text-xs leading-5 text-zinc-600">
+                          当前首字：{formatDurationLabel(currentBenchmark.speed.firstTokenMedianMs)}
+                        </span>
+                      ) : null}
+                      {finishedBenchmarks.length > 0 ? (
+                        <span className="break-all text-xs leading-5 text-zinc-500">已测：{finishedBenchmarks.length} 个模型</span>
+                      ) : null}
+                      {fastestBenchmark?.speed?.medianMs ? (
+                        <span className="break-all text-xs leading-5 text-zinc-500">
+                          最快：{fastestBenchmark.model} · {formatDurationLabel(fastestBenchmark.speed.medianMs)}
+                        </span>
+                      ) : null}
+                      {quickestFirstTokenBenchmark?.speed?.firstTokenMedianMs ? (
+                        <span className="break-all text-xs leading-5 text-zinc-500">
+                          首字最快：{quickestFirstTokenBenchmark.model} ·{" "}
+                          {formatDurationLabel(quickestFirstTokenBenchmark.speed.firstTokenMedianMs)}
+                        </span>
+                      ) : null}
+                      {recommendedBenchmark ? (
+                        <span className="break-all text-xs leading-5 text-zinc-500">
+                          推荐默认：{recommendedBenchmark.model}
+                        </span>
+                      ) : null}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="mt-3 grid gap-2 border-t border-zinc-200 pt-2 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
+                  <div className="flex items-center gap-2 overflow-x-auto">
+                    <button
+                      type="button"
+                      className={smallBtn}
+                      onClick={() => testConfig(item)}
+                      disabled={testing}
+                      title="测试"
+                      aria-label="测试"
+                    >
+                      {testing ? <FaSpinner className="animate-spin" aria-hidden /> : <FaBolt aria-hidden />}
+                      <span>测试</span>
+                    </button>
+                    <button
+                      type="button"
+                      className={smallBtn}
+                      onClick={() => probeConfig(item)}
+                      disabled={probing}
+                      title="识别模型"
+                      aria-label="识别模型"
+                    >
+                      {probing ? <FaSpinner className="animate-spin" aria-hidden /> : <FaMagic aria-hidden />}
+                      <span>识别模型</span>
+                    </button>
+                    <button
+                      type="button"
+                      className={smallBtn}
+                      onClick={() => openBenchmarkDialog(item)}
+                      disabled={probe.supportedModels.length === 0}
+                      title={probe.supportedModels.length > 0 ? "性能评测" : "请先识别模型"}
+                      aria-label={probe.supportedModels.length > 0 ? "性能评测" : "请先识别模型"}
+                    >
+                      <FaVial aria-hidden />
+                      <span>性能评测</span>
+                    </button>
+                  </div>
+
+                  <div className="flex items-center justify-start gap-2 overflow-x-auto sm:justify-end">
+                    <button
+                      type="button"
+                      className={smallBtn}
+                      onClick={() => copyText(formatConfig(item, "txt"), `已复制：${item.name}`)}
+                      title="复制"
+                      aria-label="复制"
+                    >
+                      <FaCopy aria-hidden />
+                      <span>复制</span>
+                    </button>
+                    <ExportMenu
+                      onExport={(type) => exportOne(item, type)}
+                      extraActions={[{ label: "导出到 CC Switch", onClick: () => openCcSwitchDialog(item), tone: "accent" }]}
+                      label="导出·CC"
+                      size="small"
+                    />
+                    <button
+                      type="button"
+                      className={smallBtn}
+                      onClick={() => startEdit(item)}
+                      title="编辑"
+                      aria-label="编辑"
+                    >
+                      <FaEdit aria-hidden />
+                      <span>编辑</span>
+                    </button>
+                    <button
+                      type="button"
+                      className={smallDangerBtn}
+                      onClick={() => removeConfig(item.id)}
+                      title="删除"
+                      aria-label="删除"
+                    >
+                      <FaTrashAlt aria-hidden />
+                      <span>删除</span>
+                    </button>
+                  </div>
+                </div>
+              </>
+            )}
+          </>
+        )}
+      </li>
+    );
+  }
 
   useEffect(() => {
     if (!notice) return;
-    const timer = window.setTimeout(() => setNotice(""), 2200);
+    const timer = window.setTimeout(() => setNoticeState(null), NOTICE_DURATION_MS);
     return () => window.clearTimeout(timer);
   }, [notice]);
 
@@ -1944,7 +2766,7 @@ export default function Home() {
           <span>{label}</span>
         </button>
         {open ? (
-          <div className="absolute right-0 z-20 mt-1 w-56 rounded-2xl border border-zinc-200 bg-white p-1.5 shadow-lg">
+          <div className="absolute right-0 z-20 mt-1 w-56 rounded-2xl border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900 p-1.5 shadow-lg">
             <div className="px-2.5 pb-1 pt-1 text-[11px] font-semibold uppercase tracking-[0.12em] text-zinc-400">
               常规导出
             </div>
@@ -2001,7 +2823,8 @@ export default function Home() {
       name: parsed[0].name,
       baseUrl: parsed[0].baseUrl,
       apiKey: parsed[0].apiKey,
-      model: parsed[0].model
+      model: parsed[0].model,
+      apiFormat: parsed[0].apiFormat || "auto"
     });
     setFormSourceMeta(parsed[0].sourceMeta);
     if (parsed.length > 1) {
@@ -2011,18 +2834,28 @@ export default function Home() {
     }
   }
 
-  function addItem(name: string, baseUrl: string, apiKey: string, model: string, sourceMeta?: KeyConfig["sourceMeta"]) {
+  function addItem(
+    name: string,
+    baseUrl: string,
+    apiKey: string,
+    model: string,
+    apiFormat: OpenAIProxyApiFormat,
+    sourceMeta?: KeyConfig["sourceMeta"]
+  ) {
     const item: KeyConfig = {
-      id: crypto.randomUUID(),
+      id: createClientId(),
       name,
       baseUrl,
       apiKey,
       model,
+      apiFormat,
+      listStatus: "success",
       createdAt: new Date().toISOString(),
       sourceMeta: sourceMeta || { kind: "manual" }
     };
     setConfigs((prev) => [item, ...prev]);
-    setForm({ name: "", baseUrl: "", apiKey: "", model: "" });
+    revealSavedConfig(item.id);
+    setForm({ name: "", baseUrl: "", apiKey: "", model: "", apiFormat: "auto" });
     setFormSourceMeta(undefined);
     setPasteRaw("");
   }
@@ -2035,13 +2868,19 @@ export default function Home() {
 
     const newItems = createKeyConfigsFromParsed(parsed);
     setConfigs((prev) => [...newItems, ...prev]);
-    setForm({ name: "", baseUrl: "", apiKey: "", model: "" });
+    revealSavedConfig(newItems[0].id);
+    setForm({ name: "", baseUrl: "", apiKey: "", model: "", apiFormat: "auto" });
     setFormSourceMeta(undefined);
     setPasteRaw("");
     setNotice(noticeText.replace("{count}", String(newItems.length)));
   }
 
   function addFromPaste() {
+    if (!isConfigStoreReady) {
+      setNotice(configStoreError || "项目配置正在加载，请稍候");
+      return;
+    }
+
     const parsed = parsePastedConfigs(pasteRaw, nextIndex);
     if (parsed.length === 0) {
       setNotice("未识别到可插入字段");
@@ -2080,6 +2919,11 @@ export default function Home() {
 
   function addConfig(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
+    if (!isConfigStoreReady) {
+      setNotice(configStoreError || "项目配置正在加载，请稍候");
+      return;
+    }
+
     const baseUrl = normalizeBaseUrl(form.baseUrl);
     const apiKey = cleanKey(form.apiKey);
     const model = form.model.trim();
@@ -2091,8 +2935,8 @@ export default function Home() {
     }
     if (!name) name = makeDefaultName(nextIndex);
 
-    addItem(name, baseUrl, apiKey, model, formSourceMeta);
-    setNotice("保存成功");
+    addItem(name, baseUrl, apiKey, model, form.apiFormat, formSourceMeta);
+    setNotice("保存成功，已定位到成功列表");
   }
 
   function removeConfig(id: string) {
@@ -2154,7 +2998,11 @@ export default function Home() {
 
   function commitFinishedTestResult(id: string, result: FinishedTestResult) {
     setResultMap((prev) => ({ ...prev, [id]: result }));
-    setConfigs((prev) => prev.map((item) => (item.id === id ? { ...item, lastTest: result } : item)));
+    setConfigs((prev) =>
+      prev.map((item) =>
+        item.id === id ? { ...item, lastTest: result, listStatus: result.status === "error" ? "failed" : "success" } : item
+      )
+    );
   }
 
   function commitFinishedProbeResult(id: string, result: FinishedProbeResult) {
@@ -2259,7 +3107,8 @@ export default function Home() {
         {
           baseUrl,
           apiKey,
-          model: item.model || "gpt-4o-mini"
+          model: item.model || "gpt-4o-mini",
+          apiFormat: item.apiFormat || "auto"
         },
         45000
       );
@@ -2557,28 +3406,30 @@ export default function Home() {
   }
 
   async function probeAllConfigs() {
-    if (configs.length === 0) {
-      setNotice("暂无配置可探测");
+    if (activeConfigs.length === 0) {
+      setNotice(activeList === "failed" ? "暂无失败配置可探测" : "暂无成功配置可探测");
       return;
     }
 
+    const targetConfigs = activeConfigs;
     setProbingAll(true);
-    setNotice("开始探测全部模型...");
-    const result = await Promise.all(configs.map((item) => runModelProbe(item)));
+    setNotice(`开始探测当前${activeList === "failed" ? "失败" : "成功"}列表模型...`);
+    const result = await Promise.all(targetConfigs.map((item) => runModelProbe(item)));
     const okCount = result.filter(Boolean).length;
     setProbingAll(false);
     setNotice(`探测完成：成功 ${okCount}，失败 ${result.length - okCount}`);
   }
 
   async function testAllConfigs() {
-    if (configs.length === 0) {
-      setNotice("暂无配置可测试");
+    if (activeConfigs.length === 0) {
+      setNotice(activeList === "failed" ? "暂无失败配置可测试" : "暂无成功配置可测试");
       return;
     }
 
+    const targetConfigs = activeConfigs;
     setTestingAll(true);
-    setNotice("开始测试全部配置...");
-    const result = await Promise.all(configs.map((item) => runTest(item)));
+    setNotice(`开始测试当前${activeList === "failed" ? "失败" : "成功"}列表配置...`);
+    const result = await Promise.all(targetConfigs.map((item) => runTest(item)));
     const passCount = result.filter(Boolean).length;
     const failCount = result.length - passCount;
     setTestingAll(false);
@@ -2591,12 +3442,59 @@ export default function Home() {
       return;
     }
 
-    try {
-      await navigator.clipboard.writeText(text);
+    // 优先 execCommand：在用户点击手势内同步执行，不弹浏览器剪贴板权限，
+    // 也兼容 HTTP / 局域网 IP 等非安全上下文。
+    if (copyTextWithExecCommand(text)) {
       setNotice(okText);
-    } catch {
-      setNotice("复制失败，请检查浏览器权限");
+      return;
     }
+
+    // 次选 Clipboard API（仅 HTTPS / localhost 等安全上下文）
+    if (typeof window !== "undefined" && window.isSecureContext && navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(text);
+        setNotice(okText);
+        return;
+      } catch {
+        // 继续走失败提示
+      }
+    }
+
+    setNotice("复制失败，请手动选择文本后复制");
+  }
+
+  // 同步复制：临时 textarea + execCommand，避免 Clipboard API 权限弹窗
+  function copyTextWithExecCommand(text: string): boolean {
+    if (typeof document === "undefined") return false;
+
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.setAttribute("readonly", "");
+    textarea.setAttribute("aria-hidden", "true");
+    // 需在视口内且可聚焦，部分浏览器对 off-screen / display:none 会拒绝 copy
+    textarea.style.cssText =
+      "position:fixed;top:0;left:0;width:1px;height:1px;padding:0;margin:0;border:0;opacity:0;pointer-events:none;";
+    document.body.appendChild(textarea);
+
+    const selection = document.getSelection();
+    const previousRange = selection && selection.rangeCount > 0 ? selection.getRangeAt(0) : null;
+
+    let ok = false;
+    try {
+      textarea.focus({ preventScroll: true });
+      textarea.select();
+      textarea.setSelectionRange(0, text.length);
+      ok = document.execCommand("copy");
+    } catch {
+      ok = false;
+    } finally {
+      document.body.removeChild(textarea);
+      if (selection) {
+        selection.removeAllRanges();
+        if (previousRange) selection.addRange(previousRange);
+      }
+    }
+    return ok;
   }
 
   function downloadText(filename: string, content: string) {
@@ -2681,6 +3579,7 @@ export default function Home() {
 
   function closeProbeDialog() {
     setProbeDialogId(null);
+    setProbeModelCategory("all");
   }
 
   function closeBenchmarkDialog() {
@@ -2753,21 +3652,41 @@ export default function Home() {
     setNotice(`已切换为 ${nextModel}`);
   }
 
+  function updateConfigApiFormat(id: string, apiFormat: OpenAIProxyApiFormat) {
+    setConfigs((prev) =>
+      prev.map((item) =>
+        item.id === id ? { ...item, apiFormat, lastTest: item.apiFormat === apiFormat ? item.lastTest : undefined } : item
+      )
+    );
+    setResultMap((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+    setNotice(`API 格式已切换为 ${apiFormat === "auto" ? "自动兼容" : API_FORMAT_OPTIONS.find((item) => item.value === apiFormat)?.label || apiFormat}`);
+  }
+
   function startEdit(item: KeyConfig) {
     setEditingId(item.id);
-    setEditForm({ name: item.name, baseUrl: item.baseUrl, apiKey: item.apiKey, model: item.model });
+    setEditForm({ name: item.name, baseUrl: item.baseUrl, apiKey: item.apiKey, model: item.model, apiFormat: item.apiFormat || "auto" });
   }
 
   function cancelEdit() {
     setEditingId(null);
-    setEditForm({ name: "", baseUrl: "", apiKey: "", model: "" });
+    setEditForm({ name: "", baseUrl: "", apiKey: "", model: "", apiFormat: "auto" });
   }
 
   function saveEdit(id: string) {
+    if (!isConfigStoreReady) {
+      setNotice(configStoreError || "项目配置正在加载，请稍候");
+      return;
+    }
+
     const baseUrl = normalizeBaseUrl(editForm.baseUrl);
     const apiKey = cleanKey(editForm.apiKey);
     const name = editForm.name.trim();
     const model = editForm.model.trim();
+    const apiFormat = editForm.apiFormat;
 
     if (!baseUrl || !apiKey) {
       setNotice("编辑保存失败：地址和 Key 不能为空");
@@ -2776,7 +3695,10 @@ export default function Home() {
 
     const original = configs.find((item) => item.id === id);
     const resetLastTest = original
-      ? original.baseUrl !== baseUrl || original.apiKey !== apiKey || (original.model || "") !== model
+      ? original.baseUrl !== baseUrl ||
+        original.apiKey !== apiKey ||
+        (original.model || "") !== model ||
+        (original.apiFormat || "auto") !== apiFormat
       : false;
     const resetProbe = original ? original.baseUrl !== baseUrl || original.apiKey !== apiKey : false;
     const resetBenchmarks = resetProbe;
@@ -2790,6 +3712,7 @@ export default function Home() {
               baseUrl,
               apiKey,
               model,
+              apiFormat,
               lastTest: resetLastTest ? undefined : item.lastTest,
               probe: resetProbe ? undefined : item.probe,
               benchmarks: resetBenchmarks ? undefined : item.benchmarks
@@ -2834,6 +3757,11 @@ export default function Home() {
   }
 
   function saveInlineModelEdit(id: string) {
+    if (!isConfigStoreReady) {
+      setNotice(configStoreError || "项目配置正在加载，请稍候");
+      return;
+    }
+
     const nextModel = modelDraft.trim();
     const original = configs.find((item) => item.id === id);
     const resetLastTest = original ? (original.model || "") !== nextModel : false;
@@ -2859,89 +3787,57 @@ export default function Home() {
   }
 
   return (
-    <main className="mx-auto w-full max-w-5xl space-y-3 px-3 py-4 text-zinc-900 sm:px-4">
+    <main className="mx-auto w-full max-w-6xl space-y-3 px-3 py-4 text-zinc-900 sm:px-4 dark:text-zinc-100">
       <header className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
         <div>
-          <h1 className="flex items-center gap-2.5 text-2xl font-bold tracking-tight text-zinc-900 sm:text-3xl">
+          <h1 className="flex items-center gap-2.5 text-2xl font-bold tracking-tight text-zinc-900 sm:text-3xl dark:text-zinc-50">
             <Image
               src="/logo.png"
               alt="Logo"
               width={32}
               height={32}
-              className="h-8 w-8 rounded-lg object-cover ring-1 ring-emerald-200 sm:h-9 sm:w-9"
+              className="h-8 w-8 rounded-lg object-cover ring-1 ring-emerald-200 sm:h-9 sm:w-9 dark:ring-emerald-900"
               priority
             />
             <span>AI Key Vault</span>
           </h1>
-          <p className="mt-1 text-sm text-zinc-500">本地保存、批量测试、模型识别、性能评测、复制与导出</p>
+          <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">本地保存、批量测试、模型识别、性能评测、复制与导出</p>
         </div>
-        <a
-          href={SOURCE_REPO_URL}
-          target="_blank"
-          rel="noreferrer"
-          className="group flex items-center justify-between gap-3 rounded-2xl border border-zinc-200 bg-white px-4 py-3 shadow-sm transition hover:border-zinc-300 hover:bg-zinc-50 focus:outline-none focus:ring-4 focus:ring-emerald-100 sm:min-w-72"
-          aria-label="打开项目源码 GitHub 仓库"
+        <div
+          role="group"
+          aria-label="主题切换"
+          className="inline-flex shrink-0 items-center rounded-full border border-zinc-200 bg-white p-0.5 shadow-sm dark:border-zinc-700 dark:bg-zinc-900"
         >
-          <div className="flex items-center gap-3">
-            <span className="inline-flex h-10 w-10 items-center justify-center rounded-xl border border-zinc-200 bg-zinc-950 text-white">
-              <FaGithub className="h-5 w-5" aria-hidden />
-            </span>
-            <div>
-              <p className="text-sm font-semibold text-zinc-900">项目源码 GitHub</p>
-              <p className="text-xs text-zinc-500">Yoan98/ai-key-manage</p>
-            </div>
-          </div>
-          <span className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs font-semibold text-emerald-700 transition group-hover:border-emerald-300 group-hover:bg-emerald-100">
-            <FaLink aria-hidden />
-            <span>查看源码</span>
-          </span>
-        </a>
+          {([
+            { mode: "system" as ThemeMode, label: "跟随系统", icon: <FaDesktop className="h-3.5 w-3.5" aria-hidden /> },
+            { mode: "light" as ThemeMode, label: "白天", icon: <FaSun className="h-3.5 w-3.5" aria-hidden /> },
+            { mode: "dark" as ThemeMode, label: "黑夜", icon: <FaMoon className="h-3.5 w-3.5" aria-hidden /> }
+          ]).map((option) => {
+            const active = theme === option.mode;
+            return (
+              <button
+                key={option.mode}
+                type="button"
+                onClick={() => setThemeMode(option.mode)}
+                aria-pressed={active}
+                aria-label={`切换到${option.label}主题`}
+                title={option.label}
+                className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-medium transition ${
+                  active
+                    ? "bg-emerald-600 text-white shadow-sm"
+                    : "text-zinc-600 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                }`}
+              >
+                {option.icon}
+                <span className="hidden sm:inline">{option.label}</span>
+              </button>
+            );
+          })}
+        </div>
       </header>
 
-      <section className="rounded-2xl border border-emerald-200 bg-gradient-to-br from-emerald-50 via-emerald-50/70 to-white p-3.5 shadow-sm">
-        <button
-          type="button"
-          className="flex w-full items-start justify-between gap-3 text-left"
-          onClick={() => setIntroExpanded((prev) => !prev)}
-          aria-expanded={introExpanded}
-          aria-label={introExpanded ? "收起介绍" : "展开介绍"}
-        >
-          <div>
-            <p className="text-base font-extrabold text-emerald-900 sm:text-lg">这是你的 AI API Key 本地保险箱</p>
-            <p className="mt-1 text-xs font-medium text-emerald-700/90">
-              {introExpanded ? "点击收起说明" : "包含本地保存、后端代理与使用说明；点击展开"}
-            </p>
-          </div>
-          <span className="mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-emerald-200 bg-white/80 text-emerald-700">
-            {introExpanded ? <FaChevronUp aria-hidden /> : <FaChevronDown aria-hidden />}
-          </span>
-        </button>
-
-        {introExpanded ? (
-          <>
-            <p className="mt-2 text-sm leading-6 text-emerald-800">
-              统一管理名称、地址、Key 和模型，支持粘贴导入、cc-switch SQL 文件导入、一键测试、模型识别、性能评测和唤起 CC Switch；配置数据默认仅保存在当前浏览器本地。
-            </p>
-            <div className="mt-2 rounded-xl border border-amber-200 bg-amber-50/80 p-3">
-              <div className="flex items-start gap-2.5">
-                <span className="mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-amber-200 bg-white text-amber-700">
-                  <FaInfoCircle aria-hidden />
-                </span>
-                <div className="space-y-1">
-                  <p className="text-sm font-semibold text-amber-900">请求说明</p>
-                  <p className="text-sm leading-6 text-amber-900/90">
-                    连通性测试、模型识别、性能评测这类真实联网请求会通过同源后端发起，避免浏览器直连部分上游接口时被 CORS 拦截。
-                  </p>
-                </div>
-              </div>
-            </div>
-            <p className="mt-2 text-xs font-medium text-emerald-700/90">单条配置支持直接导出到 CC Switch。</p>
-          </>
-        ) : null}
-      </section>
-
-      <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)]">
-        <section className="rounded-2xl border border-zinc-200 bg-white p-3.5 shadow-sm sm:p-4">
+      <div className="grid gap-3 lg:grid-cols-[28rem_minmax(0,1fr)]">
+        <section className="rounded-2xl border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900 p-3.5 shadow-sm sm:p-4">
           <div className="mb-3 flex items-center justify-between gap-3">
             <h2 className="text-base font-semibold text-zinc-900">新增配置</h2>
             <span className="text-xs text-zinc-500">{configs.length} 条配置</span>
@@ -2968,7 +3864,7 @@ export default function Home() {
               <FaMagic aria-hidden />
               <span>解析到表单</span>
             </button>
-            <button type="button" className={btnPrimary} onClick={addFromPaste}>
+            <button type="button" className={btnPrimary} onClick={addFromPaste} disabled={!isConfigStoreReady}>
               <FaPaste aria-hidden />
               <span>粘贴并直接新增</span>
             </button>
@@ -3014,34 +3910,154 @@ export default function Home() {
               placeholder="例如：gpt-4.1-mini"
             />
 
+            <label className={labelClass}>API 格式</label>
+            <select
+              className={inputClass}
+              value={form.apiFormat}
+              onChange={(e) => setForm((prev) => ({ ...prev, apiFormat: normalizeApiFormat(e.target.value) }))}
+            >
+              {API_FORMAT_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>{`${option.label} - ${option.hint}`}</option>
+              ))}
+            </select>
+
             <div className="mt-2 flex flex-wrap gap-2">
-              <button type="submit" className={btnPrimary}>
+              <button type="submit" className={btnPrimary} disabled={!isConfigStoreReady}>
                 <FaSave aria-hidden />
-                <span>保存配置</span>
+                <span>{isConfigStoreReady ? "保存配置" : "加载配置中"}</span>
               </button>
             </div>
           </form>
         </section>
 
-        <section className="rounded-2xl border border-zinc-200 bg-white p-3.5 shadow-sm sm:p-4">
-          <div className="mb-3 space-y-2">
-            <div className="flex items-center gap-1.5">
-              <h2 className="text-base font-semibold whitespace-nowrap text-zinc-900">配置列表</h2>
+        <section className="flex max-h-[calc(100vh-7rem)] flex-col rounded-2xl border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900 p-3.5 shadow-sm sm:p-4">
+          <div className="mb-3 space-y-2 shrink-0">
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+              <h2 className="shrink-0 text-base font-semibold text-zinc-900 dark:text-zinc-100">配置列表</h2>
+              {/* Tab 切换：成功 / 失败 */}
+              <div
+                role="tablist"
+                aria-label="配置列表视图"
+                className="inline-flex items-center rounded-full border border-zinc-200 bg-zinc-50 p-0.5 dark:border-zinc-700 dark:bg-zinc-800/60"
+              >
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={activeList === "all"}
+                  onClick={() => setActiveList("all")}
+                  className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-sm font-medium transition ${
+                    activeList === "all"
+                      ? "bg-white text-zinc-900 shadow-sm dark:bg-zinc-900 dark:text-zinc-100"
+                      : "text-zinc-500 hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200"
+                  }`}
+                >
+                  <span>成功列表</span>
+                  <span className={`inline-flex items-center justify-center rounded-full px-1.5 text-[11px] font-semibold ${activeList === "all" ? "bg-emerald-600 text-white dark:bg-emerald-500 dark:text-emerald-950" : "bg-zinc-200 text-zinc-600 dark:bg-zinc-700 dark:text-zinc-300"}`}>
+                    {visibleConfigs.length}
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={activeList === "failed"}
+                  onClick={() => setActiveList("failed")}
+                  className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-sm font-medium transition ${
+                    activeList === "failed"
+                      ? "bg-white text-zinc-900 shadow-sm dark:bg-zinc-900 dark:text-zinc-100"
+                      : "text-zinc-500 hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200"
+                  }`}
+                >
+                  <span>失败列表</span>
+                  <span className={`inline-flex items-center justify-center rounded-full px-1.5 text-[11px] font-semibold ${activeList === "failed" ? "bg-red-600 text-white dark:bg-red-500" : failedConfigs.length > 0 ? "bg-red-100 text-red-700 dark:bg-red-900/60 dark:text-red-300" : "bg-zinc-200 text-zinc-600 dark:bg-zinc-700 dark:text-zinc-300"}`}>
+                    {failedConfigs.length}
+                  </span>
+                </button>
+              </div>
+              <div className="relative ml-auto flex items-center" ref={searchBoxRef}>
+                <div className="relative flex items-center">
+                  <FaSearch className="pointer-events-none absolute left-3 text-xs text-zinc-400" aria-hidden />
+                  <input
+                    className={`${inputClass} pl-8 pr-2 py-1.5 text-sm`}
+                    value={configSearch}
+                    onChange={(e) => {
+                      setConfigSearch(e.target.value);
+                      setSearchDropdownOpen(true);
+                    }}
+                    onFocus={() => setSearchDropdownOpen(true)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        locateConfig();
+                      } else if (e.key === "Escape") {
+                        setSearchDropdownOpen(false);
+                      }
+                    }}
+                    placeholder="搜索公益站名称并选择"
+                    role="combobox"
+                    aria-controls="config-search-listbox"
+                    aria-expanded={searchDropdownOpen && searchMatches.length > 0}
+                    aria-autocomplete="list"
+                  />
+                  {searchDropdownOpen && searchMatches.length > 0 ? (
+                    <ul
+                      id="config-search-listbox"
+                      role="listbox"
+                      className="absolute left-0 right-0 top-full z-30 mt-1 max-h-72 overflow-auto rounded-2xl border border-zinc-200 bg-white p-1.5 shadow-lg dark:border-zinc-700 dark:bg-zinc-900"
+                    >
+                      {searchMatches.map((match) => (
+                        <li key={match.id} role="option" aria-selected={false}>
+                          <button
+                            type="button"
+                            className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-sm text-zinc-700 transition hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-800"
+                            // mousedown 时就定位，避免 input blur 导致列表先关闭、click 丢失
+                            onMouseDown={(e) => {
+                              e.preventDefault();
+                              locateConfigTarget(match);
+                            }}
+                          >
+                            <span
+                              className={`inline-flex h-1.5 w-1.5 shrink-0 rounded-full ${
+                                getConfigListStatus(match) === "failed" ? "bg-red-500" : "bg-emerald-500"
+                              }`}
+                              aria-hidden
+                            />
+                            <span className="min-w-0 flex-1 truncate">{match.name}</span>
+                            {match.model ? (
+                              <span className="shrink-0 truncate text-xs text-zinc-400">{match.model}</span>
+                            ) : null}
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : null}
+                </div>
+                <button
+                  type="button"
+                  className={topBtnGhost}
+                  onClick={locateConfig}
+                  disabled={searchMatches.length === 0}
+                  title="定位到首个匹配的配置"
+                >
+                  <FaSearch aria-hidden />
+                  <span>定位</span>
+                </button>
+              </div>
               <HelpHint text={endpointHintText} />
             </div>
             <div className="flex w-full flex-wrap items-center gap-2 pb-1">
               <button type="button" className={topBtnPrimary} onClick={testAllConfigs} disabled={testingAll}>
                 {testingAll ? <FaSpinner className="animate-spin" aria-hidden /> : <FaBolt aria-hidden />}
-                <span>{testingAll ? "测试中" : "一键测试全部"}</span>
+                <span>{testingAll ? "测试中" : activeList === "failed" ? "测试失败列表" : "测试成功列表"}</span>
               </button>
               <button type="button" className={topBtnGhost} onClick={probeAllConfigs} disabled={probingAll}>
                 {probingAll ? <FaSpinner className="animate-spin" aria-hidden /> : <FaMagic aria-hidden />}
-                <span>{probingAll ? "识别中" : "识别全部模型"}</span>
+                <span>{probingAll ? "识别中" : activeList === "failed" ? "识别失败列表" : "识别成功列表"}</span>
               </button>
               <button
                 type="button"
                 className={topBtnGhost}
                 onClick={() => copyText(formatAll(configs, "txt"), "已复制全部配置")}
+                disabled={configs.length === 0}
               >
                 <FaCopy aria-hidden />
                 <span>复制全部</span>
@@ -3056,395 +4072,74 @@ export default function Home() {
                 <FaTrashAlt aria-hidden />
                 <span>一键删除</span>
               </button>
+              <button
+                type="button"
+                className={topBtnGhost}
+                onClick={collapseActiveAll}
+                disabled={activeCount === 0 || activeAllCollapsed}
+                title="折叠当前列表全部卡片"
+              >
+                <FaCompressArrowsAlt aria-hidden />
+                <span>折叠全部</span>
+              </button>
+              <button
+                type="button"
+                className={topBtnGhost}
+                onClick={expandActiveAll}
+                disabled={activeCount === 0 || activeCollapsedCount === 0}
+                title="打开当前列表全部卡片"
+              >
+                <FaExpandArrowsAlt aria-hidden />
+                <span>打开全部</span>
+              </button>
+            </div>
+            {/* 模型分类筛选 */}
+            <div className="flex w-full flex-wrap items-center gap-2">
+              <div className="inline-flex flex-wrap items-center gap-1 rounded-full border border-zinc-200 bg-zinc-50 p-0.5 dark:border-zinc-700 dark:bg-zinc-800/60">
+                {MODEL_CATEGORY_OPTIONS.map((opt) => (
+                  <button
+                    key={opt.value}
+                    type="button"
+                    onClick={() => setCategoryFilter(opt.value)}
+                    className={`inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium transition ${
+                      categoryFilter === opt.value
+                        ? "bg-white text-zinc-900 shadow-sm dark:bg-zinc-900 dark:text-zinc-100"
+                        : "text-zinc-500 hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200"
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
             </div>
           </div>
 
-          {configs.length === 0 ? (
-            <p className="text-sm text-zinc-500">暂无配置</p>
+          {activeList === "failed" && failedConfigs.length === 0 ? (
+            <p className="shrink-0 text-sm text-zinc-500">暂无失败配置</p>
+          ) : activeCount === 0 ? (
+            <p className="shrink-0 text-sm text-zinc-500">
+              {activeList === "failed"
+                ? "暂无失败配置"
+                : categoryFilter !== "all" || configSearch.trim()
+                  ? "当前筛选下无配置"
+                  : "暂无配置"}
+            </p>
           ) : (
-            <ul className="grid gap-2.5">
-              {configs.map((item) => {
-                const testing = loadingMap[item.id];
-                const result = resultMap[item.id] || item.lastTest || defaultTestResult();
-                const probe = probeMap[item.id] || item.probe || defaultProbeResult();
-                const isEditing = editingId === item.id;
-                const isEditingModel = editingModelId === item.id;
-                const probing = probe.status === "pending";
-                const currentModelTags = inferModelTags(item.model);
-                const runtimeBenchmarks = benchmarkMap[item.id] || {};
-                const currentBenchmark =
-                  item.model.trim() ? runtimeBenchmarks[item.model] || item.benchmarks?.[item.model] || defaultModelBenchmarkResult(item.model) : null;
-                const finishedBenchmarks = collectFinishedBenchmarks(item, runtimeBenchmarks);
-                const fastestBenchmark = pickFastestBenchmark(finishedBenchmarks);
-                const quickestFirstTokenBenchmark = pickQuickestFirstTokenBenchmark(finishedBenchmarks);
-                const recommendedBenchmark = pickRecommendedBenchmark(finishedBenchmarks);
-
-                return (
-                  <li key={item.id} className="rounded-2xl border border-zinc-200 bg-white p-2.5">
-                    {isEditing ? (
-                      <div className="rounded-xl border border-dashed border-zinc-300 p-3">
-                        <label className={labelClass}>名称</label>
-                        <input
-                          className={inputClass}
-                          value={editForm.name}
-                          onChange={(e) => setEditForm((prev) => ({ ...prev, name: e.target.value }))}
-                        />
-
-                        <label className={labelClass}>地址</label>
-                        <input
-                          className={inputClass}
-                          value={editForm.baseUrl}
-                          onChange={(e) => setEditForm((prev) => ({ ...prev, baseUrl: e.target.value }))}
-                          placeholder="例如：https://api.openai.com"
-                        />
-                        <p className="mt-1 text-[11px] leading-5 text-zinc-500">{endpointHintText}</p>
-
-                        <label className={labelClass}>Key</label>
-                        <input
-                          className={inputClass}
-                          value={editForm.apiKey}
-                          onChange={(e) => setEditForm((prev) => ({ ...prev, apiKey: e.target.value }))}
-                        />
-
-                        <label className={labelClass}>模型</label>
-                        <input
-                          className={inputClass}
-                          value={editForm.model}
-                          onChange={(e) => setEditForm((prev) => ({ ...prev, model: e.target.value }))}
-                        />
-
-                        <div className="mt-2 flex flex-wrap gap-2">
-                          <button type="button" className={btnPrimary} onClick={() => saveEdit(item.id)}>
-                            <FaSave aria-hidden />
-                            <span>保存编辑</span>
-                          </button>
-                          <button type="button" className={btnGhost} onClick={cancelEdit}>
-                            <FaTimesCircle aria-hidden />
-                            <span>取消</span>
-                          </button>
-                        </div>
-                      </div>
-                    ) : (
-                      <>
-                        <div className="flex flex-wrap items-center gap-2">
-                          <div className="text-base font-bold text-zinc-900">{item.name}</div>
-                          <span className="rounded-full bg-zinc-100 px-2.5 py-1 text-[11px] font-medium text-zinc-600">
-                            {getSourceBadge(item.sourceMeta)}
-                          </span>
-                        </div>
-
-                        <div className="mt-2 grid gap-2">
-                          <div className="grid gap-1 sm:grid-cols-[90px_1fr] sm:items-start sm:gap-2">
-                            <span className="inline-flex items-center gap-1 text-xs text-zinc-500">
-                              <FaLink aria-hidden /> 地址
-                            </span>
-                            <div className="flex min-w-0 max-w-full items-start gap-1.5">
-                              <span className="min-w-0 flex-1 break-all text-sm text-zinc-800">{item.baseUrl || "(未填写)"}</span>
-                              <button
-                                type="button"
-                                className={iconCopyBtn}
-                                onClick={() => copyText(item.baseUrl, `已复制地址：${item.name}`)}
-                                title="复制地址"
-                                aria-label="复制地址"
-                                disabled={!item.baseUrl}
-                              >
-                                <FaCopy aria-hidden />
-                              </button>
-                            </div>
-                          </div>
-
-                          <div className="grid gap-1 sm:grid-cols-[90px_1fr] sm:items-start sm:gap-2">
-                            <span className="inline-flex items-center gap-1 text-xs text-zinc-500">
-                              <FaKey aria-hidden /> Key
-                            </span>
-                            <div className="flex min-w-0 max-w-full items-start gap-1.5">
-                              <span className="min-w-0 flex-1 break-all font-mono text-sm text-zinc-800">
-                                {item.apiKey ? toMaskedKey(item.apiKey) : "(未填写)"}
-                              </span>
-                              <button
-                                type="button"
-                                className={iconCopyBtn}
-                                onClick={() => copyText(item.apiKey, `已复制 Key：${item.name}`)}
-                                title="复制 Key"
-                                aria-label="复制 Key"
-                                disabled={!item.apiKey}
-                              >
-                                <FaCopy aria-hidden />
-                              </button>
-                            </div>
-                          </div>
-
-                          <div className="grid gap-1 sm:grid-cols-[90px_1fr] sm:items-start sm:gap-2">
-                            <span className="inline-flex items-center gap-1 text-xs text-zinc-500">
-                              <FaTag aria-hidden /> 模型
-                            </span>
-                            <div className="grid gap-1.5">
-                              {isEditingModel ? (
-                                <input
-                                  autoFocus
-                                  className={inputClass}
-                                  value={modelDraft}
-                                  onChange={(e) => setModelDraft(e.target.value)}
-                                  onBlur={() => saveInlineModelEdit(item.id)}
-                                  onKeyDown={(e) => {
-                                    if (e.key === "Enter") {
-                                      e.preventDefault();
-                                      saveInlineModelEdit(item.id);
-                                    }
-                                    if (e.key === "Escape") {
-                                      e.preventDefault();
-                                      cancelInlineModelEdit();
-                                    }
-                                  }}
-                                  placeholder="点击后可修改"
-                                />
-                              ) : (
-                                <button
-                                  type="button"
-                                  className="inline-flex w-fit rounded-md border border-zinc-200 px-2 py-1 text-sm text-zinc-700 hover:bg-zinc-50"
-                                  onClick={() => startInlineModelEdit(item)}
-                                  title="点击编辑模型"
-                                  aria-label="点击编辑模型"
-                                >
-                                  {item.model || "点击设置模型"}
-                                </button>
-                              )}
-                              {currentModelTags.length > 0 ? (
-                                <div className="flex flex-wrap gap-1.5">
-                                  {currentModelTags.map((tag) => (
-                                    <span
-                                      key={`${item.id}-${tag}`}
-                                      className={`rounded-full border px-2 py-0.5 text-[11px] font-medium uppercase tracking-[0.08em] ${getTagClassName(tag)}`}
-                                    >
-                                      {tag}
-                                    </span>
-                                  ))}
-                                </div>
-                              ) : null}
-                            </div>
-                          </div>
-
-                          <div className="grid gap-1 sm:grid-cols-[90px_1fr] sm:items-start sm:gap-2">
-                            <span className="inline-flex items-center gap-1 text-xs text-zinc-500">
-                              <FaVial aria-hidden /> 状态
-                            </span>
-                            <div className="grid gap-1">
-                              <span
-                                className={`inline-flex w-fit items-center gap-1 rounded-full px-3 py-1 text-xs font-semibold ${statusPillClass(result.status)}`}
-                              >
-                                <StatusIcon status={result.status} />
-                                <span>{result.message}</span>
-                              </span>
-                              {result.status === "error" && result.detail ? (
-                                <details className="w-full rounded-lg border border-red-100 bg-red-50/50 px-2 py-1.5 text-xs text-red-800">
-                                  <summary className="cursor-pointer font-medium text-red-700">有错误，点击查看详情</summary>
-                                  <div className="mt-1 whitespace-pre-wrap break-words leading-5">{result.detail}</div>
-                                </details>
-                              ) : result.detail ? (
-                                <span className="text-xs text-zinc-500">{result.detail}</span>
-                              ) : null}
-                              {result.responseText ? (
-                                <div className="rounded-xl border border-emerald-200 bg-emerald-50/80 p-3">
-                                  <div className="mb-1 flex flex-wrap items-center gap-2">
-                                    <div className="text-[11px] font-semibold uppercase tracking-[0.08em] text-emerald-700">
-                                      AI 返回内容
-                                    </div>
-                                    {result.responseSource ? (
-                                      <span className="rounded-full border border-emerald-300 bg-white/70 px-2 py-0.5 text-[10px] font-medium text-emerald-700">
-                                        来源：{testResponseSourceLabel(result.responseSource)}
-                                      </span>
-                                    ) : null}
-                                  </div>
-                                  <div className="whitespace-pre-wrap break-words text-xs leading-5 text-emerald-950">
-                                    {result.responseText}
-                                  </div>
-                                </div>
-                              ) : null}
-                              {item.lastTest?.testedAt ? (
-                                <span className="text-xs text-zinc-500">
-                                  上次测试：{toDateTimeLabel(item.lastTest.testedAt)}（
-                                  {item.lastTest.status === "success" ? "通过" : "失败"}）
-                                </span>
-                              ) : null}
-                            </div>
-                          </div>
-
-                          <div className="grid gap-1 sm:grid-cols-[90px_1fr] sm:items-start sm:gap-2">
-                            <span className="inline-flex items-center gap-1 text-xs text-zinc-500">
-                              <FaMagic aria-hidden /> 模型识别
-                              <HelpHint text="读取这组地址和 Key 可见的模型列表，帮助你先知道有哪些模型可以选。" />
-                            </span>
-                            <div className="grid gap-1">
-                              <span
-                                className={`inline-flex w-fit items-center gap-1 rounded-full px-3 py-1 text-xs font-semibold ${statusPillClass(probe.status)}`}
-                              >
-                                <StatusIcon status={probe.status} />
-                                <span>
-                                  {probe.status === "idle"
-                                    ? "未识别"
-                                    : probe.status === "pending"
-                                      ? "识别中..."
-                                      : probe.status === "success"
-                                        ? "识别成功"
-                                        : "识别失败"}
-                                </span>
-                              </span>
-                              {probe.recommendedModel ? (
-                                <span className="text-xs text-zinc-600">推荐模型：{probe.recommendedModel}</span>
-                              ) : null}
-                              {probe.supportedModels.length > 0 ? (
-                                <button
-                                  type="button"
-                                  className="inline-flex w-fit items-center gap-1 rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-xs font-medium text-emerald-800 hover:bg-emerald-100"
-                                  onClick={() => openProbeDialog(item)}
-                                >
-                                  <FaMagic aria-hidden />
-                                  <span>查看 {probe.supportedModels.length} 个模型</span>
-                                </button>
-                              ) : null}
-                              {probe.detail ? <span className="text-xs text-zinc-500">{probe.detail}</span> : null}
-                              {probe.testedAt ? (
-                                <span className="text-xs text-zinc-500">最近识别：{toDateTimeLabel(probe.testedAt)}</span>
-                              ) : null}
-                            </div>
-                          </div>
-
-                          <div className="grid gap-1 sm:grid-cols-[90px_1fr] sm:items-start sm:gap-2">
-                            <span className="inline-flex items-center gap-1 text-xs text-zinc-500">
-                              <FaBolt aria-hidden /> 性能评测
-                              <HelpHint text="对已识别到的模型做响应速度测试，帮你挑一个更适合日常使用的默认模型。" />
-                            </span>
-                            <div className="grid min-w-0 gap-1.5">
-                              <span
-                                className={`inline-flex w-fit items-center gap-1 rounded-full px-3 py-1 text-xs font-semibold ${
-                                  currentBenchmark ? statusPillClass(currentBenchmark.status) : statusPillClass("idle")
-                                }`}
-                              >
-                                <StatusIcon status={currentBenchmark?.status || "idle"} />
-                                <span>{currentBenchmark ? benchmarkStatusLabel(currentBenchmark) : "未测试"}</span>
-                              </span>
-                              {currentBenchmark?.speed?.medianMs ? (
-                                <span className="break-all text-xs leading-5 text-zinc-600">
-                                  当前中位：{formatDurationLabel(currentBenchmark.speed.medianMs)}
-                                </span>
-                              ) : null}
-                              {currentBenchmark?.speed?.firstTokenMedianMs ? (
-                                <span className="break-all text-xs leading-5 text-zinc-600">
-                                  当前首字：{formatDurationLabel(currentBenchmark.speed.firstTokenMedianMs)}
-                                </span>
-                              ) : null}
-                              {finishedBenchmarks.length > 0 ? (
-                                <span className="break-all text-xs leading-5 text-zinc-500">已测：{finishedBenchmarks.length} 个模型</span>
-                              ) : null}
-                              {fastestBenchmark?.speed?.medianMs ? (
-                                <span className="break-all text-xs leading-5 text-zinc-500">
-                                  最快：{fastestBenchmark.model} · {formatDurationLabel(fastestBenchmark.speed.medianMs)}
-                                </span>
-                              ) : null}
-                              {quickestFirstTokenBenchmark?.speed?.firstTokenMedianMs ? (
-                                <span className="break-all text-xs leading-5 text-zinc-500">
-                                  首字最快：{quickestFirstTokenBenchmark.model} ·{" "}
-                                  {formatDurationLabel(quickestFirstTokenBenchmark.speed.firstTokenMedianMs)}
-                                </span>
-                              ) : null}
-                              {recommendedBenchmark ? (
-                                <span className="break-all text-xs leading-5 text-zinc-500">
-                                  推荐默认：{recommendedBenchmark.model}
-                                </span>
-                              ) : null}
-                            </div>
-                          </div>
-                        </div>
-
-                        <div className="mt-3 grid gap-2 border-t border-zinc-200 pt-2 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <button
-                              type="button"
-                              className={smallBtn}
-                              onClick={() => testConfig(item)}
-                              disabled={testing}
-                              title="测试"
-                              aria-label="测试"
-                            >
-                              {testing ? <FaSpinner className="animate-spin" aria-hidden /> : <FaBolt aria-hidden />}
-                              <span>测试</span>
-                            </button>
-                            <button
-                              type="button"
-                              className={smallBtn}
-                              onClick={() => probeConfig(item)}
-                              disabled={probing}
-                              title="识别模型"
-                              aria-label="识别模型"
-                            >
-                              {probing ? <FaSpinner className="animate-spin" aria-hidden /> : <FaMagic aria-hidden />}
-                              <span>识别模型</span>
-                            </button>
-                            <button
-                              type="button"
-                              className={smallBtn}
-                              onClick={() => openBenchmarkDialog(item)}
-                              disabled={probe.supportedModels.length === 0}
-                              title={probe.supportedModels.length > 0 ? "性能评测" : "请先识别模型"}
-                              aria-label={probe.supportedModels.length > 0 ? "性能评测" : "请先识别模型"}
-                            >
-                              <FaVial aria-hidden />
-                              <span>性能评测</span>
-                            </button>
-                          </div>
-
-                          <div className="flex flex-wrap items-center justify-start gap-2 sm:justify-end">
-                            <button
-                              type="button"
-                              className={smallBtn}
-                              onClick={() => copyText(formatConfig(item, "txt"), `已复制：${item.name}`)}
-                              title="复制"
-                              aria-label="复制"
-                            >
-                              <FaCopy aria-hidden />
-                              <span>复制</span>
-                            </button>
-                            <ExportMenu
-                              onExport={(type) => exportOne(item, type)}
-                              extraActions={[{ label: "导出到 CC Switch", onClick: () => openCcSwitchDialog(item), tone: "accent" }]}
-                              label="导出·CC"
-                              size="small"
-                            />
-                            <button
-                              type="button"
-                              className={smallBtn}
-                              onClick={() => startEdit(item)}
-                              title="编辑"
-                              aria-label="编辑"
-                            >
-                              <FaEdit aria-hidden />
-                              <span>编辑</span>
-                            </button>
-                            <button
-                              type="button"
-                              className={smallDangerBtn}
-                              onClick={() => removeConfig(item.id)}
-                              title="删除"
-                              aria-label="删除"
-                            >
-                              <FaTrashAlt aria-hidden />
-                              <span>删除</span>
-                            </button>
-                          </div>
-                        </div>
-                      </>
-                    )}
-                  </li>
-                );
-              })}
+            <ul
+              className={`grid max-h-full gap-2.5 overflow-y-auto pr-1 [-ms-overflow-style:none] [scrollbar-width:thin] ${
+                activeList === "failed" ? "grid-cols-[minmax(0,42rem)] justify-start" : "grid-cols-1"
+              }`}
+            >
+              {activeConfigs.map((item) => renderConfigCard(item))}
             </ul>
           )}
         </section>
+
       </div>
 
       {ccSwitchDialogItem ? (
         <div className="fixed inset-0 z-30 flex items-center justify-center bg-zinc-950/35 px-4">
-          <div className="w-full max-w-md rounded-3xl border border-zinc-200 bg-white p-4 shadow-2xl">
+          <div className="w-full max-w-md rounded-3xl border border-zinc-200 bg-white p-4 shadow-2xl dark:border-zinc-700 dark:bg-zinc-900">
             <div className="flex items-start justify-between gap-3">
               <div>
                 <p className="text-base font-semibold text-zinc-900">导入到 CC Switch</p>
@@ -3497,7 +4192,7 @@ export default function Home() {
 
       {probeDialogItem ? (
         <div className="fixed inset-0 z-30 flex items-center justify-center bg-zinc-950/35 px-4">
-          <div className="w-full max-w-5xl rounded-[30px] border border-zinc-200 bg-white p-4 shadow-2xl sm:p-5">
+          <div className="w-full max-w-5xl rounded-[30px] border border-zinc-200 bg-white p-4 shadow-2xl sm:p-5 dark:border-zinc-700 dark:bg-zinc-900">
             {(() => {
               const activeProbe = probeMap[probeDialogItem.id] || probeDialogItem.probe || defaultProbeResult();
               const currentModel = probeDialogItem.model || "";
@@ -3571,14 +4266,43 @@ export default function Home() {
                     </div>
                   </div>
 
-                  <div className="mt-4 rounded-2xl border border-zinc-200 bg-white p-3">
+                  <div className="mt-4 rounded-2xl border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900 p-3">
                     <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
                       <p className="text-sm font-semibold text-zinc-900">已识别模型</p>
-                      <p className="text-xs text-zinc-500">轻量展示，避免和测试工作台混在一起</p>
+                      <p className="text-xs text-zinc-500">
+                        {probeModelCategory === "all"
+                          ? `共 ${activeProbe.supportedModels.length} 个模型`
+                          : `显示 ${activeProbe.supportedModels.filter((m) => inferModelCategory(m) === probeModelCategory).length} / ${activeProbe.supportedModels.length} 个模型`}
+                      </p>
+                    </div>
+                    {/* 模型分类筛选 */}
+                    <div className="mb-3 inline-flex flex-wrap items-center gap-1 rounded-full border border-zinc-200 bg-zinc-50 p-0.5 dark:border-zinc-700 dark:bg-zinc-800/60">
+                      {MODEL_CATEGORY_OPTIONS.map((opt) => (
+                        <button
+                          key={opt.value}
+                          type="button"
+                          onClick={() => setProbeModelCategory(opt.value)}
+                          className={`inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium transition ${
+                            probeModelCategory === opt.value
+                              ? "bg-white text-zinc-900 shadow-sm dark:bg-zinc-900 dark:text-zinc-100"
+                              : "text-zinc-500 hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200"
+                          }`}
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
                     </div>
                     {activeProbe.supportedModels.length > 0 ? (
-                      <div className="grid max-h-[48vh] grid-cols-1 gap-2 overflow-y-auto pr-1 lg:grid-cols-2">
-                        {activeProbe.supportedModels.map((model) => {
+                      (() => {
+                        const filteredProbeModels = activeProbe.supportedModels.filter(
+                          (m) => probeModelCategory === "all" || inferModelCategory(m) === probeModelCategory
+                        );
+                        if (filteredProbeModels.length === 0) {
+                          return <p className="text-sm text-zinc-500">当前分类下暂无模型</p>;
+                        }
+                        return (
+                          <div className="grid max-h-[48vh] grid-cols-1 gap-2 overflow-y-auto pr-1 lg:grid-cols-2">
+                            {filteredProbeModels.map((model) => {
                           const isCurrent = currentModel === model;
                           const tags = inferModelTags(model);
 
@@ -3621,7 +4345,7 @@ export default function Home() {
                               <div className="flex shrink-0 items-center gap-1.5 self-center lg:self-start">
                                 <button
                                   type="button"
-                                  className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-zinc-200 bg-white text-[11px] text-zinc-500 transition hover:border-zinc-300 hover:bg-zinc-100 hover:text-zinc-900 disabled:cursor-not-allowed disabled:opacity-45"
+                                  className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-zinc-200 bg-white text-[11px] text-zinc-500 transition hover:border-zinc-300 hover:bg-zinc-100 hover:text-zinc-900 disabled:cursor-not-allowed disabled:opacity-45 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:border-zinc-600 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
                                   onClick={() => copySingleProbeModel(model)}
                                   title={`复制 ${model}`}
                                   aria-label={`复制 ${model}`}
@@ -3645,8 +4369,10 @@ export default function Home() {
                               </div>
                             </div>
                           );
-                        })}
-                      </div>
+                            })}
+                          </div>
+                        );
+                      })()
                     ) : (
                       <p className="text-sm text-zinc-500">暂无可展示的模型列表</p>
                     )}
@@ -3661,7 +4387,7 @@ export default function Home() {
       {benchmarkDialogItem ? (
         <div className="fixed inset-0 z-30 overflow-hidden bg-zinc-950/40 px-3 py-4 sm:px-4 sm:py-8">
           <div className="flex min-h-full items-start justify-center">
-            <div className="flex max-h-[calc(100vh-32px)] w-full max-w-6xl flex-col overflow-hidden rounded-[28px] border border-zinc-200 bg-white shadow-2xl sm:max-h-[calc(100vh-64px)]">
+            <div className="flex max-h-[calc(100vh-32px)] w-full max-w-6xl flex-col overflow-hidden rounded-[28px] border border-zinc-200 bg-white shadow-2xl dark:border-zinc-700 dark:bg-zinc-900 sm:max-h-[calc(100vh-64px)]">
               <div className="flex flex-wrap items-start justify-between gap-3 border-b border-zinc-200 px-4 py-4 sm:px-5">
                 <div>
                   <p className="inline-flex items-center gap-2 text-base font-semibold text-zinc-900">
@@ -3685,7 +4411,7 @@ export default function Home() {
                 </div>
               </div>
 
-              <div className="border-b border-zinc-200 bg-zinc-50/80 px-4 py-3 sm:px-5">
+              <div className="border-b border-zinc-200 bg-zinc-50/80 px-4 py-3 sm:px-5 dark:border-zinc-700 dark:bg-zinc-800/60">
                 <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto_auto] lg:items-end">
                   <label className="block">
                     <span className="mb-1.5 block text-xs font-semibold uppercase tracking-[0.14em] text-zinc-500">搜索模型</span>
@@ -3780,7 +4506,7 @@ export default function Home() {
                     : "xl:grid-cols-[minmax(0,0.9fr)_minmax(22rem,1.1fr)]"
                 }`}
               >
-                <section className="flex min-h-0 flex-col overflow-hidden rounded-2xl border border-zinc-200 bg-white">
+                <section className="flex min-h-0 flex-col overflow-hidden rounded-2xl border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900">
                   <div className="flex flex-wrap items-center justify-between gap-3 border-b border-zinc-200 px-3 py-3">
                     <div>
                       <p className="text-sm font-semibold text-zinc-900">模型列表</p>
@@ -3917,7 +4643,7 @@ export default function Home() {
                   )}
                 </section>
 
-                <section className="flex min-h-0 flex-col overflow-hidden rounded-2xl border border-zinc-200 bg-zinc-50">
+                <section className="flex min-h-0 flex-col overflow-hidden rounded-2xl border border-zinc-200 bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-800/40">
                   <div className="border-b border-zinc-200 px-4 py-3">
                     <div className="flex flex-wrap items-center justify-between gap-3">
                       <div>
@@ -3951,23 +4677,23 @@ export default function Home() {
                       ) : null}
 
                       <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
-                        <div className="rounded-2xl border border-zinc-200 bg-white px-3 py-2.5">
+                        <div className="rounded-2xl border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900 px-3 py-2.5">
                           <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-zinc-500">成功返回</p>
                           <p className="mt-1 text-lg font-bold text-zinc-900">
                             {activeBenchmarkSummary.successModels}/{activeBenchmarkSummary.totalModels}
                           </p>
                         </div>
-                        <div className="rounded-2xl border border-zinc-200 bg-white px-3 py-2.5">
+                        <div className="rounded-2xl border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900 px-3 py-2.5">
                           <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-zinc-500">最快模型</p>
                           <p className="mt-1 text-sm font-semibold text-zinc-900">{activeBenchmarkSummary.fastestModel || "-"}</p>
                           <p className="text-xs text-zinc-500">{formatDurationLabel(activeBenchmarkSummary.fastestMedianMs)}</p>
                         </div>
-                        <div className="rounded-2xl border border-zinc-200 bg-white px-3 py-2.5">
+                        <div className="rounded-2xl border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900 px-3 py-2.5">
                           <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-zinc-500">首字最快</p>
                           <p className="mt-1 text-sm font-semibold text-zinc-900">{activeBenchmarkSummary.quickestFirstTokenModel || "-"}</p>
                           <p className="text-xs text-zinc-500">{formatDurationLabel(activeBenchmarkSummary.quickestFirstTokenMs)}</p>
                         </div>
-                        <div className="rounded-2xl border border-zinc-200 bg-white px-3 py-2.5">
+                        <div className="rounded-2xl border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900 px-3 py-2.5">
                           <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-zinc-500">最稳模型</p>
                           <p className="mt-1 text-sm font-semibold text-zinc-900">{activeBenchmarkSummary.mostStableModel || "-"}</p>
                           <p className="text-xs text-zinc-500">波动 {formatDurationLabel(activeBenchmarkSummary.stabilityMs)}</p>
@@ -3979,7 +4705,7 @@ export default function Home() {
                         </div>
                       </div>
 
-                      <div className="mt-4 rounded-2xl border border-zinc-200 bg-white">
+                      <div className="mt-4 rounded-2xl border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900">
                         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-zinc-200 px-4 py-3">
                           <div>
                             <p className="text-sm font-semibold text-zinc-900">结果摘要</p>
@@ -3995,9 +4721,9 @@ export default function Home() {
                         {benchmarkResults.length > 0 ? (
                           <div className="overflow-x-auto">
                             <table className="min-w-full border-separate border-spacing-0 text-left text-sm">
-                              <thead className="bg-zinc-50 text-xs font-semibold uppercase tracking-[0.12em] text-zinc-500">
+                              <thead className="bg-zinc-50 text-xs font-semibold uppercase tracking-[0.12em] text-zinc-500 dark:bg-zinc-800/60 dark:text-zinc-400">
                                 <tr>
-                                  <th className="sticky left-0 z-10 bg-zinc-50 px-4 py-3">模型</th>
+                                  <th className="sticky left-0 z-10 bg-zinc-50 px-4 py-3 dark:bg-zinc-800/60">模型</th>
                                   <th className="px-3 py-3">状态</th>
                                   <th className="px-3 py-3">平均</th>
                                   <th className="px-3 py-3">中位</th>
@@ -4015,15 +4741,25 @@ export default function Home() {
                                     <tr
                                       key={result.model}
                                       className={`cursor-pointer border-t border-zinc-200 text-zinc-700 transition ${
-                                        failed ? "bg-red-50/50 hover:bg-red-50" : "hover:bg-zinc-50"
+                                        failed
+                                          ? "bg-red-50/50 hover:bg-red-50 dark:bg-red-950/40 dark:hover:bg-red-950/60"
+                                          : "hover:bg-zinc-50 dark:hover:bg-zinc-800/40"
                                       } ${
-                                        focused ? "bg-emerald-50/60" : failed ? "bg-red-50/50" : "bg-white"
+                                        focused
+                                          ? "bg-emerald-50/60 dark:bg-emerald-950/30"
+                                          : failed
+                                            ? "bg-red-50/50 dark:bg-red-950/40"
+                                            : "bg-white dark:bg-zinc-900"
                                       }`}
                                       onClick={() => setBenchmarkChartModel(result.model)}
                                     >
                                       <td
                                         className={`sticky left-0 z-10 px-4 py-3 align-top ${
-                                          focused ? "bg-emerald-50/60" : failed ? "bg-red-50/50" : "bg-white"
+                                          focused
+                                            ? "bg-emerald-50/60 dark:bg-emerald-950/40"
+                                            : failed
+                                              ? "bg-red-50/50 dark:bg-red-950/50"
+                                              : "bg-white dark:bg-zinc-900"
                                         }`}
                                       >
                                         <div className="font-semibold text-zinc-900">{result.model}</div>
@@ -4062,7 +4798,7 @@ export default function Home() {
                                       <td className="px-3 py-3 text-xs text-zinc-600">
                                         <button
                                           type="button"
-                                          className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-zinc-200 bg-white text-zinc-500 transition hover:border-zinc-300 hover:bg-zinc-100 hover:text-zinc-900"
+                                          className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-zinc-200 bg-white text-zinc-500 transition hover:border-zinc-300 hover:bg-zinc-100 hover:text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:border-zinc-600 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
                                           onClick={(event) => {
                                             event.stopPropagation();
                                             setBenchmarkChartModel(result.model);
@@ -4086,7 +4822,7 @@ export default function Home() {
                       </div>
 
                       <div className="mt-4 grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
-                        <div className="rounded-2xl border border-zinc-200 bg-white p-3">
+                        <div className="rounded-2xl border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900 p-3">
                           <div className="mb-3">
                             <p className="text-sm font-semibold text-zinc-900">模型对比</p>
                             <p className="mt-1 text-xs text-zinc-500">柱状图对比平均耗时与中位耗时。</p>
@@ -4094,13 +4830,13 @@ export default function Home() {
                           {benchmarkComparisonChartOption ? (
                             <ReactECharts option={benchmarkComparisonChartOption} style={{ height: 320, width: "100%" }} notMerge />
                           ) : (
-                            <div className="flex h-80 items-center justify-center rounded-xl bg-zinc-50 text-sm text-zinc-500">
+                            <div className="flex h-80 items-center justify-center rounded-xl bg-zinc-50 text-sm text-zinc-500 dark:bg-zinc-800/40 dark:text-zinc-400">
                               暂无可绘制的图表数据
                             </div>
                           )}
                         </div>
 
-                        <div className="rounded-2xl border border-zinc-200 bg-white p-3">
+                        <div className="rounded-2xl border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900 p-3">
                           <div className="mb-3">
                             <p className="text-sm font-semibold text-zinc-900">轮次走势</p>
                             <p className="mt-1 text-xs text-zinc-500">
@@ -4110,7 +4846,7 @@ export default function Home() {
                           {benchmarkRoundChartOption ? (
                             <ReactECharts option={benchmarkRoundChartOption} style={{ height: 320, width: "100%" }} notMerge />
                           ) : (
-                            <div className="flex h-80 items-center justify-center rounded-xl bg-zinc-50 text-sm text-zinc-500">
+                            <div className="flex h-80 items-center justify-center rounded-xl bg-zinc-50 text-sm text-zinc-500 dark:bg-zinc-800/40 dark:text-zinc-400">
                               选择一个已有测速结果的模型后，这里显示轮次曲线
                             </div>
                           )}
@@ -4119,7 +4855,7 @@ export default function Home() {
 
                       {activeBenchmarkDetailResult ? (
                         <div className="fixed inset-0 z-40 flex items-center justify-center bg-zinc-950/35 px-4">
-                          <div className="max-h-[min(78vh,42rem)] w-full max-w-2xl overflow-hidden rounded-3xl border border-zinc-200 bg-white shadow-2xl">
+                          <div className="max-h-[min(78vh,42rem)] w-full max-w-2xl overflow-hidden rounded-3xl border border-zinc-200 bg-white shadow-2xl dark:border-zinc-700 dark:bg-zinc-900">
                             <div className="flex items-start justify-between gap-3 border-b border-zinc-200 px-4 py-4">
                               <div>
                                 <p className="text-base font-semibold text-zinc-900">{activeBenchmarkDetailResult.model}</p>
@@ -4169,7 +4905,7 @@ export default function Home() {
 
                               <div className="mt-4 overflow-x-auto rounded-2xl border border-zinc-200">
                                 <table className="min-w-full border-separate border-spacing-0 text-left text-sm">
-                                  <thead className="bg-zinc-50 text-xs font-semibold uppercase tracking-[0.12em] text-zinc-500">
+                                  <thead className="bg-zinc-50 text-xs font-semibold uppercase tracking-[0.12em] text-zinc-500 dark:bg-zinc-800/60 dark:text-zinc-400">
                                     <tr>
                                       <th className="px-4 py-3">轮次</th>
                                       <th className="px-4 py-3">状态</th>
@@ -4216,13 +4952,42 @@ export default function Home() {
       ) : null}
 
       <div
-        className={`pointer-events-none fixed inset-x-0 bottom-4 z-40 flex justify-center px-4 transition-all duration-200 ${
-          notice ? "translate-y-0 opacity-100" : "translate-y-3 opacity-0"
+        className={`pointer-events-none fixed inset-x-0 top-4 z-50 flex justify-center px-4 transition-all duration-200 ${
+          notice ? "translate-y-0 opacity-100" : "-translate-y-3 opacity-0"
         }`}
-        aria-live="polite"
       >
-        <div className="max-w-[min(92vw,40rem)] rounded-full border border-zinc-900 bg-zinc-900/95 px-4 py-2 text-sm font-medium text-white shadow-2xl backdrop-blur">
-          {notice || "占位"}
+        <div
+          className={`pointer-events-auto flex max-w-[min(92vw,40rem)] items-center gap-3 rounded-2xl border px-4 py-3 text-sm font-medium text-white shadow-2xl backdrop-blur ${
+            notice?.tone === "success"
+              ? "border-emerald-300 bg-emerald-600/95 dark:border-emerald-700 dark:bg-emerald-700/95"
+              : notice?.tone === "error"
+                ? "border-red-300 bg-red-600/95 dark:border-red-700 dark:bg-red-700/95"
+                : "border-sky-300 bg-sky-600/95 dark:border-sky-700 dark:bg-sky-700/95"
+          }`}
+          role={notice?.tone === "error" ? "alert" : "status"}
+          aria-live={notice?.tone === "error" ? "assertive" : "polite"}
+          data-notice-tone={notice?.tone || "hidden"}
+        >
+          {notice?.tone === "success" ? (
+            <FaCheckCircle className="shrink-0 text-base" aria-hidden />
+          ) : notice?.tone === "error" ? (
+            <FaTimesCircle className="shrink-0 text-base" aria-hidden />
+          ) : (
+            <FaInfoCircle className="shrink-0 text-base" aria-hidden />
+          )}
+          <span className="min-w-0 flex-1">{notice?.message || ""}</span>
+          {notice ? (
+            <button
+              type="button"
+              className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-lg leading-none text-white/80 transition hover:bg-white/15 hover:text-white focus:outline-none focus:ring-2 focus:ring-white/70"
+              onClick={() => setNoticeState(null)}
+              aria-label="关闭提示"
+              title="关闭"
+              data-testid="notice-close"
+            >
+              ×
+            </button>
+          ) : null}
         </div>
       </div>
     </main>

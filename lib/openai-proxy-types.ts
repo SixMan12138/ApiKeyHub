@@ -1,3 +1,5 @@
+export type OpenAIProxyApiFormat = "auto" | "chat" | "responses" | "messages";
+
 export type OpenAIProxyBaseRequest = {
   baseUrl: string;
   apiKey: string;
@@ -5,6 +7,7 @@ export type OpenAIProxyBaseRequest = {
 
 export type OpenAIProxyTestRequest = OpenAIProxyBaseRequest & {
   model?: string;
+  apiFormat?: OpenAIProxyApiFormat;
 };
 
 export type OpenAIProxyTestResponse = {
@@ -14,7 +17,7 @@ export type OpenAIProxyTestResponse = {
     message: string;
     detail?: string;
     responseText?: string;
-    responseSource?: "stream" | "chat" | "responses";
+    responseSource?: "stream" | "chat" | "responses" | "messages";
     testedAt: string;
   };
 };
