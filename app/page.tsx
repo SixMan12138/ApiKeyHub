@@ -81,6 +81,11 @@ type FormState = {
 
 type ExportType = "md" | "txt";
 type TestStatus = "idle" | "pending" | "success" | "error";
+type NoticeTone = "success" | "error" | "info";
+type NoticeState = {
+  message: string;
+  tone: NoticeTone;
+};
 type CcSwitchApp = "claude" | "codex" | "gemini" | "opencode" | "openclaw";
 type ThemeMode = "system" | "light" | "dark";
 
@@ -165,9 +170,11 @@ type CcSwitchAction = {
   tone?: "default" | "accent";
 };
 
-const STORAGE_KEY = "ai-key-vault-configs-v1";
-const LEGACY_STORAGE_KEYS = ["ai-key-vault-configs", "ai-key-check-configs-v1"];
 const THEME_STORAGE_KEY = "ai-key-vault-theme-v1";
+const CLIENT_ID_RANDOM_BYTE_COUNT = 16;
+const NOTICE_DURATION_MS = 3000;
+const NOTICE_ERROR_KEYWORDS = ["失败", "错误", "暂无", "没有", "不能为空", "未识别", "请先", "重试"];
+const NOTICE_SUCCESS_KEYWORDS = ["成功", "完成", "已", "通过"];
 const PASS_TEXT = "主人，快鞭策我吧";
 const FAIL_TEXT = "主人，我不行了";
 const DEFAULT_BENCHMARK_ROUNDS = 2;
@@ -246,6 +253,50 @@ const iconCopyBtn =
   "inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-zinc-400 transition hover:bg-zinc-100 hover:text-zinc-700 disabled:cursor-not-allowed disabled:opacity-45 dark:hover:bg-zinc-700 dark:hover:text-zinc-200";
 const endpointHintText = "地址只填域名也可以，系统会自动兼容 /v1、/chat/completions、/responses、/messages；API 格式可单独选择，自动兼容会优先 Chat Completions，再按需尝试 Responses。";
 const ReactECharts = dynamic(() => import("echarts-for-react"), { ssr: false });
+
+function createClientId(): string {
+  const webCrypto = globalThis.crypto;
+  if (typeof webCrypto?.randomUUID === "function") return webCrypto.randomUUID();
+
+  if (typeof webCrypto?.getRandomValues === "function") {
+    const randomBytes = webCrypto.getRandomValues(new Uint8Array(CLIENT_ID_RANDOM_BYTE_COUNT));
+    const randomPart = Array.from(randomBytes, (value) => value.toString(16).padStart(2, "0")).join("");
+    return `cfg-${Date.now().toString(36)}-${randomPart}`;
+  }
+
+  return `cfg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+function inferNoticeTone(message: string): NoticeTone {
+  if (message.startsWith("开始")) return "info";
+
+  const toneMessage = message.replaceAll("失败列表", "列表");
+  if (NOTICE_ERROR_KEYWORDS.some((keyword) => toneMessage.includes(keyword))) return "error";
+  if (NOTICE_SUCCESS_KEYWORDS.some((keyword) => toneMessage.includes(keyword))) return "success";
+  return "info";
+}
+
+function parseConfigTimestamp(value?: string): number | null {
+  if (!value) return null;
+
+  const timestamp = Date.parse(value);
+  return Number.isNaN(timestamp) ? null : timestamp;
+}
+
+function compareConfigsByTestedAtDesc(left: KeyConfig, right: KeyConfig): number {
+  const leftTestedAt = parseConfigTimestamp(left.lastTest?.testedAt);
+  const rightTestedAt = parseConfigTimestamp(right.lastTest?.testedAt);
+
+  if (leftTestedAt !== null || rightTestedAt !== null) {
+    if (leftTestedAt === null) return 1;
+    if (rightTestedAt === null) return -1;
+    if (leftTestedAt !== rightTestedAt) return rightTestedAt - leftTestedAt;
+  }
+
+  const leftCreatedAt = parseConfigTimestamp(left.createdAt) || 0;
+  const rightCreatedAt = parseConfigTimestamp(right.createdAt) || 0;
+  return rightCreatedAt - leftCreatedAt;
+}
 
 function normalizeBaseUrl(raw: string): string {
   const cleaned = raw.trim().replace(/\/+$/, "");
@@ -616,7 +667,7 @@ function finalizeParsed(items: Partial<ParsedConfig>[], startIndex: number): Par
 
 function createKeyConfigsFromParsed(items: ParsedConfig[]): KeyConfig[] {
   return items.map((item) => ({
-    id: crypto.randomUUID(),
+    id: createClientId(),
     name: item.name,
     baseUrl: item.baseUrl,
     apiKey: item.apiKey,
@@ -1406,7 +1457,7 @@ function makeErrorDetail(error: unknown): string {
 function normalizeStoredConfigItem(input: unknown, index: number): KeyConfig | undefined {
   if (!isRecord(input)) return undefined;
 
-  const id = typeof input.id === "string" && input.id ? input.id : crypto.randomUUID();
+  const id = typeof input.id === "string" && input.id ? input.id : createClientId();
   const rawName = firstNonEmptyString(input.name, input.title, input.label);
   const baseUrl = normalizeBaseUrl(
     firstNonEmptyString(input.baseUrl, input.baseURL, input.url, input.endpoint, input.apiBaseUrl, input.api_url)
@@ -1462,26 +1513,6 @@ function normalizeStoredConfigs(raw: string): KeyConfig[] {
   return normalized;
 }
 
-function loadConfigsFromStorage(storage: Storage): { configs: KeyConfig[]; sourceKey?: string } {
-  const candidateKeys = [STORAGE_KEY, ...LEGACY_STORAGE_KEYS];
-
-  for (const key of candidateKeys) {
-    const raw = storage.getItem(key);
-    if (!raw) continue;
-
-    try {
-      const configs = normalizeStoredConfigs(raw);
-      if (configs.length > 0) {
-        return { configs, sourceKey: key };
-      }
-    } catch {
-      continue;
-    }
-  }
-
-  return { configs: [] };
-}
-
 function defaultTestResult(): TestResult {
   return { status: "idle", message: "未测试" };
 }
@@ -1528,7 +1559,10 @@ function HelpHint({ text }: { text: string }) {
 
 export default function Home() {
   const ccSwitchSqlInputRef = useRef<HTMLInputElement | null>(null);
+  const configWriteQueueRef = useRef<Promise<void>>(Promise.resolve());
   const [configs, setConfigs] = useState<KeyConfig[]>([]);
+  const [isConfigStoreReady, setIsConfigStoreReady] = useState(false);
+  const [configStoreError, setConfigStoreError] = useState("");
   const [form, setForm] = useState<FormState>({ name: "", baseUrl: "", apiKey: "", model: "", apiFormat: "auto" });
   const [formSourceMeta, setFormSourceMeta] = useState<KeyConfig["sourceMeta"]>();
   const [pasteRaw, setPasteRaw] = useState("");
@@ -1536,7 +1570,7 @@ export default function Home() {
   const [resultMap, setResultMap] = useState<Record<string, TestResult>>({});
   const [probeMap, setProbeMap] = useState<Record<string, ProbeResult>>({});
   const [benchmarkMap, setBenchmarkMap] = useState<Record<string, Record<string, ModelBenchmarkResult>>>({});
-  const [notice, setNotice] = useState("");
+  const [notice, setNoticeState] = useState<NoticeState | null>(null);
   const [testingAll, setTestingAll] = useState(false);
   const [probingAll, setProbingAll] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -1559,23 +1593,74 @@ export default function Home() {
   const [collapsedIds, setCollapsedIds] = useState<Record<string, boolean>>({});
   const [categoryFilter, setCategoryFilter] = useState<ModelCategoryFilter>("all");
   const [configSearch, setConfigSearch] = useState("");
+  const [searchDropdownOpen, setSearchDropdownOpen] = useState(false);
+  const searchBoxRef = useRef<HTMLDivElement | null>(null);
   const [highlightedConfigId, setHighlightedConfigId] = useState<string | null>(null);
   const [probeModelCategory, setProbeModelCategory] = useState<ModelCategoryFilter>("all");
   const cardItemRefs = useRef<Record<string, HTMLLIElement | null>>({});
 
-  useEffect(() => {
-    const { configs: restoredConfigs, sourceKey } = loadConfigsFromStorage(localStorage);
-    if (restoredConfigs.length === 0) return;
-
-    setConfigs(restoredConfigs);
-    if (sourceKey && sourceKey !== STORAGE_KEY) {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(restoredConfigs));
+  function setNotice(message: string, tone?: NoticeTone) {
+    if (!message) {
+      setNoticeState(null);
+      return;
     }
+
+    setNoticeState({ message, tone: tone || inferNoticeTone(message) });
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadProjectConfigs() {
+      try {
+        const response = await fetch("/api/configs", { cache: "no-store" });
+        if (!response.ok) throw new Error("读取项目配置失败");
+
+        const payload: unknown = await response.json();
+        const storedConfigs =
+          typeof payload === "object" && payload !== null && "configs" in payload
+            ? (payload as { configs: unknown }).configs
+            : [];
+
+        if (!cancelled) {
+          setConfigs(normalizeStoredConfigs(JSON.stringify(storedConfigs)));
+          setIsConfigStoreReady(true);
+          setConfigStoreError("");
+        }
+      } catch {
+        if (!cancelled) {
+          const errorMessage = "读取项目配置失败，请刷新页面重试";
+          setConfigStoreError(errorMessage);
+          setNotice(errorMessage);
+        }
+      }
+    }
+
+    void loadProjectConfigs();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(configs));
-  }, [configs]);
+    if (!isConfigStoreReady) return;
+
+    configWriteQueueRef.current = configWriteQueueRef.current
+      .catch(() => undefined)
+      .then(async () => {
+        const response = await fetch("/api/configs", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ configs })
+        });
+        if (!response.ok) throw new Error("保存项目配置失败");
+      })
+      .catch(() => {
+        const errorMessage = "保存项目配置失败，请检查服务状态后重试";
+        setConfigStoreError(errorMessage);
+        setNotice(errorMessage);
+      });
+  }, [configs, isConfigStoreReady]);
 
   // 主题初始化：读取本地存储，否则默认跟随系统。
   useEffect(() => {
@@ -1584,6 +1669,28 @@ export default function Home() {
       stored === "light" || stored === "dark" || stored === "system" ? stored : "system";
     setTheme(normalized);
   }, []);
+
+  // 搜索下拉：点击外部或按 Esc 关闭候选列表。
+  useEffect(() => {
+    if (!searchDropdownOpen) return;
+
+    function handlePointerDown(event: MouseEvent) {
+      if (!searchBoxRef.current?.contains(event.target as Node)) {
+        setSearchDropdownOpen(false);
+      }
+    }
+
+    function handleEscape(event: KeyboardEvent) {
+      if (event.key === "Escape") setSearchDropdownOpen(false);
+    }
+
+    document.addEventListener("mousedown", handlePointerDown);
+    document.addEventListener("keydown", handleEscape);
+    return () => {
+      document.removeEventListener("mousedown", handlePointerDown);
+      document.removeEventListener("keydown", handleEscape);
+    };
+  }, [searchDropdownOpen]);
 
   // 主题应用 + 监听系统主题变化（仅 system 模式生效）。
   useEffect(() => {
@@ -1631,8 +1738,9 @@ export default function Home() {
   function getConfigListStatus(item: KeyConfig): "success" | "failed" {
     return item.listStatus || (item.lastTest?.status === "error" ? "failed" : "success");
   }
-  const failedConfigs = configs.filter((item) => getConfigListStatus(item) === "failed");
-  const visibleConfigs = configs.filter((item) => getConfigListStatus(item) === "success");
+  const sortedConfigs = [...configs].sort(compareConfigsByTestedAtDesc);
+  const failedConfigs = sortedConfigs.filter((item) => getConfigListStatus(item) === "failed");
+  const visibleConfigs = sortedConfigs.filter((item) => getConfigListStatus(item) === "success");
 
   // 折叠/展开全部 的控制范围跟随当前激活的列表
   const [activeList, setActiveList] = useState<"all" | "failed">("all");
@@ -1645,22 +1753,61 @@ export default function Home() {
   const activeCollapsedCount = activeConfigs.filter((item) => isConfigCollapsed(item.id)).length;
   const activeAllCollapsed = activeCount > 0 && activeCollapsedCount === activeCount;
 
-  // 搜索定位：全局搜索配置名称，自动切到目标所在列表并高亮、展开
-  function locateConfig() {
+  // 搜索匹配：按名称模糊匹配，最多展示 8 条候选
+  const searchMatches = useMemo(() => {
     const query = configSearch.trim().toLowerCase();
-    if (!query) return;
-    const target = configs.find((item) => item.name.toLowerCase().includes(query));
-    if (!target) return;
+    if (!query) return [];
+    return sortedConfigs.filter((item) => item.name.toLowerCase().includes(query)).slice(0, 8);
+  }, [configSearch, sortedConfigs]);
+
+  // 搜索定位：切到目标所在列表并高亮、展开，再滚动到对应卡片
+  function locateConfigTarget(target: KeyConfig) {
     setActiveList(getConfigListStatus(target) === "failed" ? "failed" : "all");
     setCategoryFilter("all");
+    setConfigSearch(target.name);
     setCollapsedIds((prev) => ({ ...prev, [target.id]: false }));
     setHighlightedConfigId(target.id);
-    setTimeout(() => {
+    setSearchDropdownOpen(false);
+
+    // 等列表切换 / 展开渲染完成后再滚动；多帧重试避免 ref 尚未挂载
+    const scrollToCard = (attempt: number) => {
       const el = cardItemRefs.current[target.id];
-      if (el) el.scrollIntoView({ block: "nearest", behavior: "smooth" });
-    }, 120);
-    setTimeout(() => {
+      if (el) {
+        el.scrollIntoView({ block: "center", behavior: "smooth" });
+        return;
+      }
+      if (attempt < 8) {
+        window.setTimeout(() => scrollToCard(attempt + 1), 50);
+      }
+    };
+    window.setTimeout(() => scrollToCard(0), 50);
+
+    window.setTimeout(() => {
       setHighlightedConfigId((cur) => (cur === target.id ? null : cur));
+    }, 2200);
+  }
+
+  // 回车/点击「定位」：跳到首个匹配项
+  function locateConfig() {
+    const target = searchMatches[0];
+    if (!target) return;
+    locateConfigTarget(target);
+  }
+
+  function revealSavedConfig(id: string) {
+    setActiveList("all");
+    setCategoryFilter("all");
+    setConfigSearch("");
+    setCollapsedIds((prev) => ({ ...prev, [id]: false }));
+    setHighlightedConfigId(id);
+
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        cardItemRefs.current[id]?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      });
+    });
+    setTimeout(() => {
+      setHighlightedConfigId((currentId) => (currentId === id ? null : currentId));
     }, 2200);
   }
 
@@ -1693,10 +1840,11 @@ export default function Home() {
     return (
       <li
         key={item.id}
+        data-config-id={item.id}
         ref={(el) => {
           cardItemRefs.current[item.id] = el;
         }}
-        className={`rounded-2xl border bg-white p-2.5 transition dark:bg-zinc-900 ${
+        className={`w-full min-w-0 rounded-2xl border bg-white p-2.5 transition dark:bg-zinc-900 ${
           highlightedConfigId === item.id
             ? "border-emerald-400 ring-2 ring-emerald-300 dark:border-emerald-500 dark:ring-emerald-500/60"
             : "border-zinc-200 dark:border-zinc-700"
@@ -1864,11 +2012,19 @@ export default function Home() {
                       <FaLink aria-hidden /> 地址
                     </span>
                     <div className="flex min-w-0 max-w-full items-start gap-1.5">
-                      <span className="min-w-0 flex-1 break-all text-sm text-zinc-800">{item.baseUrl || "(未填写)"}</span>
+                      <button
+                        type="button"
+                        className="min-w-0 flex-1 break-all rounded-md px-1 py-0.5 text-left text-sm text-zinc-800 transition hover:bg-zinc-100 hover:text-emerald-700 disabled:cursor-default disabled:hover:bg-transparent disabled:hover:text-zinc-800 dark:text-zinc-100 dark:hover:bg-zinc-800 dark:hover:text-emerald-300 dark:disabled:hover:text-zinc-100"
+                        onClick={() => void copyText(item.baseUrl, `已复制地址：${item.name}`)}
+                        title={item.baseUrl ? "点击复制地址" : "未填写地址"}
+                        disabled={!item.baseUrl}
+                      >
+                        {item.baseUrl || "(未填写)"}
+                      </button>
                       <button
                         type="button"
                         className={iconCopyBtn}
-                        onClick={() => copyText(item.baseUrl, `已复制地址：${item.name}`)}
+                        onClick={() => void copyText(item.baseUrl, `已复制地址：${item.name}`)}
                         title="复制地址"
                         aria-label="复制地址"
                         disabled={!item.baseUrl}
@@ -1883,13 +2039,19 @@ export default function Home() {
                       <FaKey aria-hidden /> Key
                     </span>
                     <div className="flex min-w-0 max-w-full items-start gap-1.5">
-                      <span className="min-w-0 flex-1 break-all font-mono text-sm text-zinc-800">
+                      <button
+                        type="button"
+                        className="min-w-0 flex-1 break-all rounded-md px-1 py-0.5 text-left font-mono text-sm text-zinc-800 transition hover:bg-zinc-100 hover:text-emerald-700 disabled:cursor-default disabled:hover:bg-transparent disabled:hover:text-zinc-800 dark:text-zinc-100 dark:hover:bg-zinc-800 dark:hover:text-emerald-300 dark:disabled:hover:text-zinc-100"
+                        onClick={() => void copyText(item.apiKey, `已复制 Key：${item.name}`)}
+                        title={item.apiKey ? "点击复制 Key" : "未填写 Key"}
+                        disabled={!item.apiKey}
+                      >
                         {item.apiKey ? toMaskedKey(item.apiKey) : "(未填写)"}
-                      </span>
+                      </button>
                       <button
                         type="button"
                         className={iconCopyBtn}
-                        onClick={() => copyText(item.apiKey, `已复制 Key：${item.name}`)}
+                        onClick={() => void copyText(item.apiKey, `已复制 Key：${item.name}`)}
                         title="复制 Key"
                         aria-label="复制 Key"
                         disabled={!item.apiKey}
@@ -2182,7 +2344,7 @@ export default function Home() {
 
   useEffect(() => {
     if (!notice) return;
-    const timer = window.setTimeout(() => setNotice(""), 2200);
+    const timer = window.setTimeout(() => setNoticeState(null), NOTICE_DURATION_MS);
     return () => window.clearTimeout(timer);
   }, [notice]);
 
@@ -2681,7 +2843,7 @@ export default function Home() {
     sourceMeta?: KeyConfig["sourceMeta"]
   ) {
     const item: KeyConfig = {
-      id: crypto.randomUUID(),
+      id: createClientId(),
       name,
       baseUrl,
       apiKey,
@@ -2692,6 +2854,7 @@ export default function Home() {
       sourceMeta: sourceMeta || { kind: "manual" }
     };
     setConfigs((prev) => [item, ...prev]);
+    revealSavedConfig(item.id);
     setForm({ name: "", baseUrl: "", apiKey: "", model: "", apiFormat: "auto" });
     setFormSourceMeta(undefined);
     setPasteRaw("");
@@ -2705,6 +2868,7 @@ export default function Home() {
 
     const newItems = createKeyConfigsFromParsed(parsed);
     setConfigs((prev) => [...newItems, ...prev]);
+    revealSavedConfig(newItems[0].id);
     setForm({ name: "", baseUrl: "", apiKey: "", model: "", apiFormat: "auto" });
     setFormSourceMeta(undefined);
     setPasteRaw("");
@@ -2712,6 +2876,11 @@ export default function Home() {
   }
 
   function addFromPaste() {
+    if (!isConfigStoreReady) {
+      setNotice(configStoreError || "项目配置正在加载，请稍候");
+      return;
+    }
+
     const parsed = parsePastedConfigs(pasteRaw, nextIndex);
     if (parsed.length === 0) {
       setNotice("未识别到可插入字段");
@@ -2750,6 +2919,11 @@ export default function Home() {
 
   function addConfig(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
+    if (!isConfigStoreReady) {
+      setNotice(configStoreError || "项目配置正在加载，请稍候");
+      return;
+    }
+
     const baseUrl = normalizeBaseUrl(form.baseUrl);
     const apiKey = cleanKey(form.apiKey);
     const model = form.model.trim();
@@ -2762,7 +2936,7 @@ export default function Home() {
     if (!name) name = makeDefaultName(nextIndex);
 
     addItem(name, baseUrl, apiKey, model, form.apiFormat, formSourceMeta);
-    setNotice("保存成功");
+    setNotice("保存成功，已定位到成功列表");
   }
 
   function removeConfig(id: string) {
@@ -3268,12 +3442,59 @@ export default function Home() {
       return;
     }
 
-    try {
-      await navigator.clipboard.writeText(text);
+    // 优先 execCommand：在用户点击手势内同步执行，不弹浏览器剪贴板权限，
+    // 也兼容 HTTP / 局域网 IP 等非安全上下文。
+    if (copyTextWithExecCommand(text)) {
       setNotice(okText);
-    } catch {
-      setNotice("复制失败，请检查浏览器权限");
+      return;
     }
+
+    // 次选 Clipboard API（仅 HTTPS / localhost 等安全上下文）
+    if (typeof window !== "undefined" && window.isSecureContext && navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(text);
+        setNotice(okText);
+        return;
+      } catch {
+        // 继续走失败提示
+      }
+    }
+
+    setNotice("复制失败，请手动选择文本后复制");
+  }
+
+  // 同步复制：临时 textarea + execCommand，避免 Clipboard API 权限弹窗
+  function copyTextWithExecCommand(text: string): boolean {
+    if (typeof document === "undefined") return false;
+
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.setAttribute("readonly", "");
+    textarea.setAttribute("aria-hidden", "true");
+    // 需在视口内且可聚焦，部分浏览器对 off-screen / display:none 会拒绝 copy
+    textarea.style.cssText =
+      "position:fixed;top:0;left:0;width:1px;height:1px;padding:0;margin:0;border:0;opacity:0;pointer-events:none;";
+    document.body.appendChild(textarea);
+
+    const selection = document.getSelection();
+    const previousRange = selection && selection.rangeCount > 0 ? selection.getRangeAt(0) : null;
+
+    let ok = false;
+    try {
+      textarea.focus({ preventScroll: true });
+      textarea.select();
+      textarea.setSelectionRange(0, text.length);
+      ok = document.execCommand("copy");
+    } catch {
+      ok = false;
+    } finally {
+      document.body.removeChild(textarea);
+      if (selection) {
+        selection.removeAllRanges();
+        if (previousRange) selection.addRange(previousRange);
+      }
+    }
+    return ok;
   }
 
   function downloadText(filename: string, content: string) {
@@ -3456,6 +3677,11 @@ export default function Home() {
   }
 
   function saveEdit(id: string) {
+    if (!isConfigStoreReady) {
+      setNotice(configStoreError || "项目配置正在加载，请稍候");
+      return;
+    }
+
     const baseUrl = normalizeBaseUrl(editForm.baseUrl);
     const apiKey = cleanKey(editForm.apiKey);
     const name = editForm.name.trim();
@@ -3531,6 +3757,11 @@ export default function Home() {
   }
 
   function saveInlineModelEdit(id: string) {
+    if (!isConfigStoreReady) {
+      setNotice(configStoreError || "项目配置正在加载，请稍候");
+      return;
+    }
+
     const nextModel = modelDraft.trim();
     const original = configs.find((item) => item.id === id);
     const resetLastTest = original ? (original.model || "") !== nextModel : false;
@@ -3633,7 +3864,7 @@ export default function Home() {
               <FaMagic aria-hidden />
               <span>解析到表单</span>
             </button>
-            <button type="button" className={btnPrimary} onClick={addFromPaste}>
+            <button type="button" className={btnPrimary} onClick={addFromPaste} disabled={!isConfigStoreReady}>
               <FaPaste aria-hidden />
               <span>粘贴并直接新增</span>
             </button>
@@ -3691,9 +3922,9 @@ export default function Home() {
             </select>
 
             <div className="mt-2 flex flex-wrap gap-2">
-              <button type="submit" className={btnPrimary}>
+              <button type="submit" className={btnPrimary} disabled={!isConfigStoreReady}>
                 <FaSave aria-hidden />
-                <span>保存配置</span>
+                <span>{isConfigStoreReady ? "保存配置" : "加载配置中"}</span>
               </button>
             </div>
           </form>
@@ -3742,25 +3973,69 @@ export default function Home() {
                   </span>
                 </button>
               </div>
-              <div className="relative ml-auto flex items-center">
-                <FaSearch className="pointer-events-none absolute left-3 text-xs text-zinc-400" aria-hidden />
-                <input
-                  className={`${inputClass} pl-8 pr-2 py-1.5 text-sm`}
-                  value={configSearch}
-                  onChange={(e) => setConfigSearch(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      e.preventDefault();
-                      locateConfig();
-                    }
-                  }}
-                  placeholder="搜索公益站名称并定位"
-                />
+              <div className="relative ml-auto flex items-center" ref={searchBoxRef}>
+                <div className="relative flex items-center">
+                  <FaSearch className="pointer-events-none absolute left-3 text-xs text-zinc-400" aria-hidden />
+                  <input
+                    className={`${inputClass} pl-8 pr-2 py-1.5 text-sm`}
+                    value={configSearch}
+                    onChange={(e) => {
+                      setConfigSearch(e.target.value);
+                      setSearchDropdownOpen(true);
+                    }}
+                    onFocus={() => setSearchDropdownOpen(true)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        locateConfig();
+                      } else if (e.key === "Escape") {
+                        setSearchDropdownOpen(false);
+                      }
+                    }}
+                    placeholder="搜索公益站名称并选择"
+                    role="combobox"
+                    aria-controls="config-search-listbox"
+                    aria-expanded={searchDropdownOpen && searchMatches.length > 0}
+                    aria-autocomplete="list"
+                  />
+                  {searchDropdownOpen && searchMatches.length > 0 ? (
+                    <ul
+                      id="config-search-listbox"
+                      role="listbox"
+                      className="absolute left-0 right-0 top-full z-30 mt-1 max-h-72 overflow-auto rounded-2xl border border-zinc-200 bg-white p-1.5 shadow-lg dark:border-zinc-700 dark:bg-zinc-900"
+                    >
+                      {searchMatches.map((match) => (
+                        <li key={match.id} role="option" aria-selected={false}>
+                          <button
+                            type="button"
+                            className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-sm text-zinc-700 transition hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-800"
+                            // mousedown 时就定位，避免 input blur 导致列表先关闭、click 丢失
+                            onMouseDown={(e) => {
+                              e.preventDefault();
+                              locateConfigTarget(match);
+                            }}
+                          >
+                            <span
+                              className={`inline-flex h-1.5 w-1.5 shrink-0 rounded-full ${
+                                getConfigListStatus(match) === "failed" ? "bg-red-500" : "bg-emerald-500"
+                              }`}
+                              aria-hidden
+                            />
+                            <span className="min-w-0 flex-1 truncate">{match.name}</span>
+                            {match.model ? (
+                              <span className="shrink-0 truncate text-xs text-zinc-400">{match.model}</span>
+                            ) : null}
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : null}
+                </div>
                 <button
                   type="button"
                   className={topBtnGhost}
                   onClick={locateConfig}
-                  disabled={activeCount === 0}
+                  disabled={searchMatches.length === 0}
                   title="定位到首个匹配的配置"
                 >
                   <FaSearch aria-hidden />
@@ -3850,7 +4125,11 @@ export default function Home() {
                   : "暂无配置"}
             </p>
           ) : (
-            <ul className="grid max-h-full gap-2.5 overflow-y-auto pr-1 [-ms-overflow-style:none] [scrollbar-width:thin]">
+            <ul
+              className={`grid max-h-full gap-2.5 overflow-y-auto pr-1 [-ms-overflow-style:none] [scrollbar-width:thin] ${
+                activeList === "failed" ? "grid-cols-[minmax(0,42rem)] justify-start" : "grid-cols-1"
+              }`}
+            >
               {activeConfigs.map((item) => renderConfigCard(item))}
             </ul>
           )}
@@ -4673,13 +4952,42 @@ export default function Home() {
       ) : null}
 
       <div
-        className={`pointer-events-none fixed inset-x-0 bottom-4 z-40 flex justify-center px-4 transition-all duration-200 ${
-          notice ? "translate-y-0 opacity-100" : "translate-y-3 opacity-0"
+        className={`pointer-events-none fixed inset-x-0 top-4 z-50 flex justify-center px-4 transition-all duration-200 ${
+          notice ? "translate-y-0 opacity-100" : "-translate-y-3 opacity-0"
         }`}
-        aria-live="polite"
       >
-        <div className="max-w-[min(92vw,40rem)] rounded-full border border-zinc-900 bg-zinc-900/95 px-4 py-2 text-sm font-medium text-white shadow-2xl backdrop-blur">
-          {notice || "占位"}
+        <div
+          className={`pointer-events-auto flex max-w-[min(92vw,40rem)] items-center gap-3 rounded-2xl border px-4 py-3 text-sm font-medium text-white shadow-2xl backdrop-blur ${
+            notice?.tone === "success"
+              ? "border-emerald-300 bg-emerald-600/95 dark:border-emerald-700 dark:bg-emerald-700/95"
+              : notice?.tone === "error"
+                ? "border-red-300 bg-red-600/95 dark:border-red-700 dark:bg-red-700/95"
+                : "border-sky-300 bg-sky-600/95 dark:border-sky-700 dark:bg-sky-700/95"
+          }`}
+          role={notice?.tone === "error" ? "alert" : "status"}
+          aria-live={notice?.tone === "error" ? "assertive" : "polite"}
+          data-notice-tone={notice?.tone || "hidden"}
+        >
+          {notice?.tone === "success" ? (
+            <FaCheckCircle className="shrink-0 text-base" aria-hidden />
+          ) : notice?.tone === "error" ? (
+            <FaTimesCircle className="shrink-0 text-base" aria-hidden />
+          ) : (
+            <FaInfoCircle className="shrink-0 text-base" aria-hidden />
+          )}
+          <span className="min-w-0 flex-1">{notice?.message || ""}</span>
+          {notice ? (
+            <button
+              type="button"
+              className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-lg leading-none text-white/80 transition hover:bg-white/15 hover:text-white focus:outline-none focus:ring-2 focus:ring-white/70"
+              onClick={() => setNoticeState(null)}
+              aria-label="关闭提示"
+              title="关闭"
+              data-testid="notice-close"
+            >
+              ×
+            </button>
+          ) : null}
         </div>
       </div>
     </main>
