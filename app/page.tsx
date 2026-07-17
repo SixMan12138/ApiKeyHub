@@ -5,6 +5,7 @@ import Image from "next/image";
 import type { EChartsOption } from "echarts";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  FaBan,
   FaBolt,
   FaCheckCircle,
   FaChevronDown,
@@ -47,7 +48,7 @@ type KeyConfig = {
   apiKey: string;
   model: string;
   apiFormat?: OpenAIProxyApiFormat;
-  listStatus?: "success" | "failed";
+  listStatus?: "success" | "failed" | "disabled";
   createdAt: string;
   sourceMeta?: {
     kind: "manual" | "cc-switch-provider" | "cc-switch-deeplink";
@@ -1472,13 +1473,15 @@ function normalizeStoredConfigItem(input: unknown, index: number): KeyConfig | u
   const apiFormat = normalizeApiFormat(input.apiFormat || input.api_format || input.format || input.endpointFormat);
   const rawListStatus = input.listStatus || input.list_status || input.groupStatus;
   const listStatus: KeyConfig["listStatus"] =
-    rawListStatus === "failed" || rawListStatus === "error"
-      ? "failed"
-      : rawListStatus === "success"
-        ? "success"
-        : lastTest?.status === "error"
-          ? "failed"
-          : "success";
+    rawListStatus === "disabled" || rawListStatus === "disable" || rawListStatus === "off"
+      ? "disabled"
+      : rawListStatus === "failed" || rawListStatus === "error"
+        ? "failed"
+        : rawListStatus === "success"
+          ? "success"
+          : lastTest?.status === "error"
+            ? "failed"
+            : "success";
   const hasCoreValue = Boolean(rawName || baseUrl || apiKey || model || probe || lastTest || benchmarks);
 
   if (!hasCoreValue) return undefined;
@@ -1722,7 +1725,7 @@ export default function Home() {
     }
   }
 
-  // 卡片折叠/展开：默认折叠（未在 collapsedIds 中即视为折叠）
+  // 卡片折叠/展开：默认一律折叠；仅当 collapsedIds[id] === false 时才展开
   function isConfigCollapsed(id: string) {
     return collapsedIds[id] !== false;
   }
@@ -1731,20 +1734,28 @@ export default function Home() {
     setCollapsedIds((prev) => ({ ...prev, [id]: prev[id] !== false ? false : true }));
   }
 
+  function ensureCollapsed(id: string) {
+    setCollapsedIds((prev) => (prev[id] === false ? { ...prev, [id]: true } : prev));
+  }
+
   // 卡片展示状态取运行时结果；列表归属使用持久 listStatus，避免测试中/编辑时在成功与失败列表之间跳动
   function getConfigResult(item: KeyConfig): TestResult {
     return resultMap[item.id] || item.lastTest || defaultTestResult();
   }
-  function getConfigListStatus(item: KeyConfig): "success" | "failed" {
-    return item.listStatus || (item.lastTest?.status === "error" ? "failed" : "success");
+  function getConfigListStatus(item: KeyConfig): "success" | "failed" | "disabled" {
+    if (item.listStatus === "disabled") return "disabled";
+    if (item.listStatus === "failed" || item.listStatus === "success") return item.listStatus;
+    return item.lastTest?.status === "error" ? "failed" : "success";
   }
   const sortedConfigs = [...configs].sort(compareConfigsByTestedAtDesc);
   const failedConfigs = sortedConfigs.filter((item) => getConfigListStatus(item) === "failed");
+  const disabledConfigs = sortedConfigs.filter((item) => getConfigListStatus(item) === "disabled");
   const visibleConfigs = sortedConfigs.filter((item) => getConfigListStatus(item) === "success");
 
   // 折叠/展开全部 的控制范围跟随当前激活的列表
-  const [activeList, setActiveList] = useState<"all" | "failed">("all");
-  const baseActiveConfigs = activeList === "failed" ? failedConfigs : visibleConfigs;
+  const [activeList, setActiveList] = useState<"all" | "failed" | "disabled">("all");
+  const baseActiveConfigs =
+    activeList === "failed" ? failedConfigs : activeList === "disabled" ? disabledConfigs : visibleConfigs;
   // 按模型分类过滤（与失败/配置列表切换叠加）
   const activeConfigs = baseActiveConfigs.filter(
     (item) => categoryFilter === "all" || inferModelCategory(item.model) === categoryFilter
@@ -1762,7 +1773,8 @@ export default function Home() {
 
   // 搜索定位：切到目标所在列表并高亮、展开，再滚动到对应卡片
   function locateConfigTarget(target: KeyConfig) {
-    setActiveList(getConfigListStatus(target) === "failed" ? "failed" : "all");
+    const status = getConfigListStatus(target);
+    setActiveList(status === "failed" ? "failed" : status === "disabled" ? "disabled" : "all");
     setCategoryFilter("all");
     setConfigSearch(target.name);
     setCollapsedIds((prev) => ({ ...prev, [target.id]: false }));
@@ -1798,7 +1810,8 @@ export default function Home() {
     setActiveList("all");
     setCategoryFilter("all");
     setConfigSearch("");
-    setCollapsedIds((prev) => ({ ...prev, [id]: false }));
+    // 新保存的配置也保持折叠，只高亮并滚入视野
+    ensureCollapsed(id);
     setHighlightedConfigId(id);
 
     requestAnimationFrame(() => {
@@ -1819,7 +1832,7 @@ export default function Home() {
     setCollapsedIds((prev) => ({ ...prev, ...Object.fromEntries(activeConfigs.map((item) => [item.id, false])) }));
   }
 
-  // 共享卡片渲染：配置列表与失败列表共用同一函数，折叠/小框设计一致复用
+  // 共享卡片渲染：成功 / 失败 / 禁用列表共用同一函数，折叠/小框设计一致复用
   function renderConfigCard(item: KeyConfig) {
     const testing = loadingMap[item.id];
     const result = getConfigResult(item);
@@ -1828,6 +1841,7 @@ export default function Home() {
     const isEditingModel = editingModelId === item.id;
     const isCollapsed = !isEditing && isConfigCollapsed(item.id);
     const probing = probe.status === "pending";
+    const isDisabled = getConfigListStatus(item) === "disabled";
     const currentModelTags = inferModelTags(item.model);
     const runtimeBenchmarks = benchmarkMap[item.id] || {};
     const currentBenchmark =
@@ -1847,7 +1861,9 @@ export default function Home() {
         className={`w-full min-w-0 rounded-2xl border bg-white p-2.5 transition dark:bg-zinc-900 ${
           highlightedConfigId === item.id
             ? "border-emerald-400 ring-2 ring-emerald-300 dark:border-emerald-500 dark:ring-emerald-500/60"
-            : "border-zinc-200 dark:border-zinc-700"
+            : isDisabled
+              ? "border-zinc-300 opacity-95 dark:border-zinc-600"
+              : "border-zinc-200 dark:border-zinc-700"
         }`}
       >
         {isEditing ? (
@@ -1927,39 +1943,64 @@ export default function Home() {
                   <FaChevronDown aria-hidden />
                 </span>
               </span>
-              <div className="min-w-0 max-w-[min(42vw,22rem)] truncate text-base font-bold text-zinc-900 dark:text-zinc-100">{item.name}</div>
+              <div className="min-w-0 max-w-[min(48vw,28rem)] truncate text-base font-bold text-zinc-900 dark:text-zinc-100">{item.name}</div>
               <span
-                className={`inline-flex shrink-0 items-center gap-1 rounded-full px-2.5 py-1 text-xs font-semibold ${statusPillClass(result.status)}`}
+                className={`inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-xs ${statusPillClass(result.status)}`}
                 title={result.message}
+                aria-label={result.message}
               >
                 <StatusIcon status={result.status} />
-                <span className="max-w-[10rem] truncate">{result.message}</span>
               </span>
               </div>
               {isCollapsed ? (
                 <div className="ml-auto flex shrink-0 items-center gap-1.5">
-                  <button
-                    type="button"
-                    className={smallBtn}
-                    onClick={() => testConfig(item)}
-                    disabled={testing}
-                    title="测试"
-                    aria-label="测试"
-                  >
-                    {testing ? <FaSpinner className="animate-spin" aria-hidden /> : <FaBolt aria-hidden />}
-                    <span>测试</span>
-                  </button>
-                  <button
-                    type="button"
-                    className={smallBtn}
-                    onClick={() => probeConfig(item)}
-                    disabled={probing}
-                    title="识别模型"
-                    aria-label="识别模型"
-                  >
-                    {probing ? <FaSpinner className="animate-spin" aria-hidden /> : <FaMagic aria-hidden />}
-                    <span>识别模型</span>
-                  </button>
+                  {isDisabled ? (
+                    <button
+                      type="button"
+                      className={smallBtn}
+                      onClick={() => enableConfig(item.id)}
+                      title="启用"
+                      aria-label="启用"
+                    >
+                      <FaCheckCircle aria-hidden />
+                      <span>启用</span>
+                    </button>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        className={smallBtn}
+                        onClick={() => testConfig(item)}
+                        disabled={testing}
+                        title="测试"
+                        aria-label="测试"
+                      >
+                        {testing ? <FaSpinner className="animate-spin" aria-hidden /> : <FaBolt aria-hidden />}
+                        <span>测试</span>
+                      </button>
+                      <button
+                        type="button"
+                        className={smallBtn}
+                        onClick={() => probeConfig(item)}
+                        disabled={probing}
+                        title="识别模型"
+                        aria-label="识别模型"
+                      >
+                        {probing ? <FaSpinner className="animate-spin" aria-hidden /> : <FaMagic aria-hidden />}
+                        <span>识别模型</span>
+                      </button>
+                      <button
+                        type="button"
+                        className={smallBtn}
+                        onClick={() => disableConfig(item.id)}
+                        title="禁用"
+                        aria-label="禁用"
+                      >
+                        <FaBan aria-hidden />
+                        <span>禁用</span>
+                      </button>
+                    </>
+                  )}
                   <button
                     type="button"
                     className={smallBtn}
@@ -2260,39 +2301,64 @@ export default function Home() {
 
                 <div className="mt-3 grid gap-2 border-t border-zinc-200 pt-2 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
                   <div className="flex items-center gap-2 overflow-x-auto">
-                    <button
-                      type="button"
-                      className={smallBtn}
-                      onClick={() => testConfig(item)}
-                      disabled={testing}
-                      title="测试"
-                      aria-label="测试"
-                    >
-                      {testing ? <FaSpinner className="animate-spin" aria-hidden /> : <FaBolt aria-hidden />}
-                      <span>测试</span>
-                    </button>
-                    <button
-                      type="button"
-                      className={smallBtn}
-                      onClick={() => probeConfig(item)}
-                      disabled={probing}
-                      title="识别模型"
-                      aria-label="识别模型"
-                    >
-                      {probing ? <FaSpinner className="animate-spin" aria-hidden /> : <FaMagic aria-hidden />}
-                      <span>识别模型</span>
-                    </button>
-                    <button
-                      type="button"
-                      className={smallBtn}
-                      onClick={() => openBenchmarkDialog(item)}
-                      disabled={probe.supportedModels.length === 0}
-                      title={probe.supportedModels.length > 0 ? "性能评测" : "请先识别模型"}
-                      aria-label={probe.supportedModels.length > 0 ? "性能评测" : "请先识别模型"}
-                    >
-                      <FaVial aria-hidden />
-                      <span>性能评测</span>
-                    </button>
+                    {isDisabled ? (
+                      <button
+                        type="button"
+                        className={smallBtn}
+                        onClick={() => enableConfig(item.id)}
+                        title="启用"
+                        aria-label="启用"
+                      >
+                        <FaCheckCircle aria-hidden />
+                        <span>启用</span>
+                      </button>
+                    ) : (
+                      <>
+                        <button
+                          type="button"
+                          className={smallBtn}
+                          onClick={() => testConfig(item)}
+                          disabled={testing}
+                          title="测试"
+                          aria-label="测试"
+                        >
+                          {testing ? <FaSpinner className="animate-spin" aria-hidden /> : <FaBolt aria-hidden />}
+                          <span>测试</span>
+                        </button>
+                        <button
+                          type="button"
+                          className={smallBtn}
+                          onClick={() => probeConfig(item)}
+                          disabled={probing}
+                          title="识别模型"
+                          aria-label="识别模型"
+                        >
+                          {probing ? <FaSpinner className="animate-spin" aria-hidden /> : <FaMagic aria-hidden />}
+                          <span>识别模型</span>
+                        </button>
+                        <button
+                          type="button"
+                          className={smallBtn}
+                          onClick={() => openBenchmarkDialog(item)}
+                          disabled={probe.supportedModels.length === 0}
+                          title={probe.supportedModels.length > 0 ? "性能评测" : "请先识别模型"}
+                          aria-label={probe.supportedModels.length > 0 ? "性能评测" : "请先识别模型"}
+                        >
+                          <FaVial aria-hidden />
+                          <span>性能评测</span>
+                        </button>
+                        <button
+                          type="button"
+                          className={smallBtn}
+                          onClick={() => disableConfig(item.id)}
+                          title="禁用"
+                          aria-label="禁用"
+                        >
+                          <FaBan aria-hidden />
+                          <span>禁用</span>
+                        </button>
+                      </>
+                    )}
                   </div>
 
                   <div className="flex items-center justify-start gap-2 overflow-x-auto sm:justify-end">
@@ -2999,10 +3065,44 @@ export default function Home() {
   function commitFinishedTestResult(id: string, result: FinishedTestResult) {
     setResultMap((prev) => ({ ...prev, [id]: result }));
     setConfigs((prev) =>
-      prev.map((item) =>
-        item.id === id ? { ...item, lastTest: result, listStatus: result.status === "error" ? "failed" : "success" } : item
-      )
+      prev.map((item) => {
+        if (item.id !== id) return item;
+        // 禁用列表只更新测试结果，不因测试成功/失败而离开禁用列表
+        if (item.listStatus === "disabled") {
+          return { ...item, lastTest: result };
+        }
+        return {
+          ...item,
+          lastTest: result,
+          listStatus: result.status === "error" ? "failed" : "success"
+        };
+      })
     );
+  }
+
+  function disableConfig(id: string) {
+    const target = configs.find((item) => item.id === id);
+    setConfigs((prev) => prev.map((item) => (item.id === id ? { ...item, listStatus: "disabled" } : item)));
+    setActiveList("disabled");
+    ensureCollapsed(id);
+    setHighlightedConfigId(id);
+    setNotice(target ? `已禁用：${target.name}` : "已移入禁用列表");
+    window.setTimeout(() => {
+      setHighlightedConfigId((currentId) => (currentId === id ? null : currentId));
+    }, 2200);
+  }
+
+  function enableConfig(id: string) {
+    const target = configs.find((item) => item.id === id);
+    // 启用后固定进入成功列表，保持折叠
+    setConfigs((prev) => prev.map((item) => (item.id === id ? { ...item, listStatus: "success" } : item)));
+    setActiveList("all");
+    ensureCollapsed(id);
+    setHighlightedConfigId(id);
+    setNotice(target ? `已启用：${target.name}` : "已启用配置");
+    window.setTimeout(() => {
+      setHighlightedConfigId((currentId) => (currentId === id ? null : currentId));
+    }, 2200);
   }
 
   function commitFinishedProbeResult(id: string, result: FinishedProbeResult) {
@@ -3084,6 +3184,11 @@ export default function Home() {
   }
 
   async function runTest(item: KeyConfig): Promise<boolean> {
+    if (getConfigListStatus(item) === "disabled") {
+      setNotice(`${item.name} 已禁用，无法测试`);
+      return false;
+    }
+
     setLoadingMap((prev) => ({ ...prev, [item.id]: true }));
     setResultMap((prev) => ({ ...prev, [item.id]: { status: "pending", message: "测试中..." } }));
 
@@ -3129,6 +3234,10 @@ export default function Home() {
   }
 
   async function testConfig(item: KeyConfig) {
+    if (getConfigListStatus(item) === "disabled") {
+      setNotice(`${item.name} 已禁用，无法测试`);
+      return;
+    }
     const ok = await runTest(item);
     setNotice(ok ? `${item.name} 测试通过` : `${item.name} 测试失败`);
   }
@@ -3406,6 +3515,10 @@ export default function Home() {
   }
 
   async function probeAllConfigs() {
+    if (activeList === "disabled") {
+      setNotice("禁用列表不支持批量识别");
+      return;
+    }
     if (activeConfigs.length === 0) {
       setNotice(activeList === "failed" ? "暂无失败配置可探测" : "暂无成功配置可探测");
       return;
@@ -3421,6 +3534,10 @@ export default function Home() {
   }
 
   async function testAllConfigs() {
+    if (activeList === "disabled") {
+      setNotice("禁用列表不支持批量测试");
+      return;
+    }
     if (activeConfigs.length === 0) {
       setNotice(activeList === "failed" ? "暂无失败配置可测试" : "暂无成功配置可测试");
       return;
@@ -3672,8 +3789,11 @@ export default function Home() {
   }
 
   function cancelEdit() {
+    const editing = editingId;
     setEditingId(null);
     setEditForm({ name: "", baseUrl: "", apiKey: "", model: "", apiFormat: "auto" });
+    // 取消编辑后回到折叠，避免列表里留下展开卡片
+    if (editing) ensureCollapsed(editing);
   }
 
   function saveEdit(id: string) {
@@ -3748,6 +3868,7 @@ export default function Home() {
     }
 
     cancelEdit();
+    ensureCollapsed(id);
     setNotice("已保存编辑");
   }
 
@@ -3787,7 +3908,7 @@ export default function Home() {
   }
 
   return (
-    <main className="mx-auto w-full max-w-6xl space-y-3 px-3 py-4 text-zinc-900 sm:px-4 dark:text-zinc-100">
+    <main className="mx-auto w-full max-w-7xl space-y-3 px-3 py-4 text-zinc-900 sm:px-5 lg:px-6 dark:text-zinc-100">
       <header className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
         <div>
           <h1 className="flex items-center gap-2.5 text-2xl font-bold tracking-tight text-zinc-900 sm:text-3xl dark:text-zinc-50">
@@ -3836,8 +3957,8 @@ export default function Home() {
         </div>
       </header>
 
-      <div className="grid gap-3 lg:grid-cols-[28rem_minmax(0,1fr)]">
-        <section className="rounded-2xl border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900 p-3.5 shadow-sm sm:p-4">
+      <div className="grid gap-3 lg:grid-cols-[minmax(22rem,26rem)_minmax(0,1fr)] xl:grid-cols-[minmax(24rem,28rem)_minmax(0,1fr)]">
+        <section className="rounded-2xl border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900 p-3.5 shadow-sm sm:p-5">
           <div className="mb-3 flex items-center justify-between gap-3">
             <h2 className="text-base font-semibold text-zinc-900">新增配置</h2>
             <span className="text-xs text-zinc-500">{configs.length} 条配置</span>
@@ -3930,15 +4051,15 @@ export default function Home() {
           </form>
         </section>
 
-        <section className="flex max-h-[calc(100vh-7rem)] flex-col rounded-2xl border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900 p-3.5 shadow-sm sm:p-4">
-          <div className="mb-3 space-y-2 shrink-0">
+        <section className="flex min-w-0 max-h-[calc(100vh-7rem)] flex-col rounded-2xl border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900 p-3.5 shadow-sm sm:p-5">
+          <div className="mb-3 space-y-2.5 shrink-0">
             <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
               <h2 className="shrink-0 text-base font-semibold text-zinc-900 dark:text-zinc-100">配置列表</h2>
-              {/* Tab 切换：成功 / 失败 */}
+              {/* Tab 切换：紧挨「配置列表」标题右侧 */}
               <div
                 role="tablist"
                 aria-label="配置列表视图"
-                className="inline-flex items-center rounded-full border border-zinc-200 bg-zinc-50 p-0.5 dark:border-zinc-700 dark:bg-zinc-800/60"
+                className="inline-flex max-w-full flex-wrap items-center rounded-full border border-zinc-200 bg-zinc-50 p-0.5 dark:border-zinc-700 dark:bg-zinc-800/60"
               >
                 <button
                   type="button"
@@ -3972,87 +4093,38 @@ export default function Home() {
                     {failedConfigs.length}
                   </span>
                 </button>
-              </div>
-              <div className="relative ml-auto flex items-center" ref={searchBoxRef}>
-                <div className="relative flex items-center">
-                  <FaSearch className="pointer-events-none absolute left-3 text-xs text-zinc-400" aria-hidden />
-                  <input
-                    className={`${inputClass} pl-8 pr-2 py-1.5 text-sm`}
-                    value={configSearch}
-                    onChange={(e) => {
-                      setConfigSearch(e.target.value);
-                      setSearchDropdownOpen(true);
-                    }}
-                    onFocus={() => setSearchDropdownOpen(true)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") {
-                        e.preventDefault();
-                        locateConfig();
-                      } else if (e.key === "Escape") {
-                        setSearchDropdownOpen(false);
-                      }
-                    }}
-                    placeholder="搜索公益站名称并选择"
-                    role="combobox"
-                    aria-controls="config-search-listbox"
-                    aria-expanded={searchDropdownOpen && searchMatches.length > 0}
-                    aria-autocomplete="list"
-                  />
-                  {searchDropdownOpen && searchMatches.length > 0 ? (
-                    <ul
-                      id="config-search-listbox"
-                      role="listbox"
-                      className="absolute left-0 right-0 top-full z-30 mt-1 max-h-72 overflow-auto rounded-2xl border border-zinc-200 bg-white p-1.5 shadow-lg dark:border-zinc-700 dark:bg-zinc-900"
-                    >
-                      {searchMatches.map((match) => (
-                        <li key={match.id} role="option" aria-selected={false}>
-                          <button
-                            type="button"
-                            className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-sm text-zinc-700 transition hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-800"
-                            // mousedown 时就定位，避免 input blur 导致列表先关闭、click 丢失
-                            onMouseDown={(e) => {
-                              e.preventDefault();
-                              locateConfigTarget(match);
-                            }}
-                          >
-                            <span
-                              className={`inline-flex h-1.5 w-1.5 shrink-0 rounded-full ${
-                                getConfigListStatus(match) === "failed" ? "bg-red-500" : "bg-emerald-500"
-                              }`}
-                              aria-hidden
-                            />
-                            <span className="min-w-0 flex-1 truncate">{match.name}</span>
-                            {match.model ? (
-                              <span className="shrink-0 truncate text-xs text-zinc-400">{match.model}</span>
-                            ) : null}
-                          </button>
-                        </li>
-                      ))}
-                    </ul>
-                  ) : null}
-                </div>
                 <button
                   type="button"
-                  className={topBtnGhost}
-                  onClick={locateConfig}
-                  disabled={searchMatches.length === 0}
-                  title="定位到首个匹配的配置"
+                  role="tab"
+                  aria-selected={activeList === "disabled"}
+                  onClick={() => setActiveList("disabled")}
+                  className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-sm font-medium transition ${
+                    activeList === "disabled"
+                      ? "bg-white text-zinc-900 shadow-sm dark:bg-zinc-900 dark:text-zinc-100"
+                      : "text-zinc-500 hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200"
+                  }`}
                 >
-                  <FaSearch aria-hidden />
-                  <span>定位</span>
+                  <span>禁用列表</span>
+                  <span className={`inline-flex items-center justify-center rounded-full px-1.5 text-[11px] font-semibold ${activeList === "disabled" ? "bg-zinc-700 text-white dark:bg-zinc-500 dark:text-zinc-950" : disabledConfigs.length > 0 ? "bg-zinc-300 text-zinc-700 dark:bg-zinc-600 dark:text-zinc-200" : "bg-zinc-200 text-zinc-600 dark:bg-zinc-700 dark:text-zinc-300"}`}>
+                    {disabledConfigs.length}
+                  </span>
                 </button>
               </div>
               <HelpHint text={endpointHintText} />
             </div>
             <div className="flex w-full flex-wrap items-center gap-2 pb-1">
-              <button type="button" className={topBtnPrimary} onClick={testAllConfigs} disabled={testingAll}>
-                {testingAll ? <FaSpinner className="animate-spin" aria-hidden /> : <FaBolt aria-hidden />}
-                <span>{testingAll ? "测试中" : activeList === "failed" ? "测试失败列表" : "测试成功列表"}</span>
-              </button>
-              <button type="button" className={topBtnGhost} onClick={probeAllConfigs} disabled={probingAll}>
-                {probingAll ? <FaSpinner className="animate-spin" aria-hidden /> : <FaMagic aria-hidden />}
-                <span>{probingAll ? "识别中" : activeList === "failed" ? "识别失败列表" : "识别成功列表"}</span>
-              </button>
+              {activeList !== "disabled" ? (
+                <>
+                  <button type="button" className={topBtnPrimary} onClick={testAllConfigs} disabled={testingAll}>
+                    {testingAll ? <FaSpinner className="animate-spin" aria-hidden /> : <FaBolt aria-hidden />}
+                    <span>{testingAll ? "测试中" : activeList === "failed" ? "测试失败列表" : "测试成功列表"}</span>
+                  </button>
+                  <button type="button" className={topBtnGhost} onClick={probeAllConfigs} disabled={probingAll}>
+                    {probingAll ? <FaSpinner className="animate-spin" aria-hidden /> : <FaMagic aria-hidden />}
+                    <span>{probingAll ? "识别中" : activeList === "failed" ? "识别失败列表" : "识别成功列表"}</span>
+                  </button>
+                </>
+              ) : null}
               <button
                 type="button"
                 className={topBtnGhost}
@@ -4092,6 +4164,83 @@ export default function Home() {
                 <FaExpandArrowsAlt aria-hidden />
                 <span>打开全部</span>
               </button>
+
+              <div
+                className="relative ml-auto flex min-w-0 w-full max-w-md items-center gap-2 sm:w-auto sm:min-w-[16rem]"
+                ref={searchBoxRef}
+              >
+                <div className="relative min-w-0 flex-1">
+                  <FaSearch className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-xs text-zinc-400" aria-hidden />
+                  <input
+                    className="w-full rounded-xl border border-zinc-300 bg-white py-2 pl-8 pr-3 text-sm text-zinc-900 outline-none transition hover:border-zinc-400 focus:border-zinc-400 focus:ring-4 focus:ring-emerald-100 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 dark:hover:border-zinc-600 dark:focus:border-zinc-600 dark:focus:ring-emerald-900/40"
+                    value={configSearch}
+                    onChange={(e) => {
+                      setConfigSearch(e.target.value);
+                      setSearchDropdownOpen(true);
+                    }}
+                    onFocus={() => setSearchDropdownOpen(true)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        locateConfig();
+                      } else if (e.key === "Escape") {
+                        setSearchDropdownOpen(false);
+                      }
+                    }}
+                    placeholder="搜索公益站名称并选择"
+                    role="combobox"
+                    aria-controls="config-search-listbox"
+                    aria-expanded={searchDropdownOpen && searchMatches.length > 0}
+                    aria-autocomplete="list"
+                  />
+                  {searchDropdownOpen && searchMatches.length > 0 ? (
+                    <ul
+                      id="config-search-listbox"
+                      role="listbox"
+                      className="absolute left-0 right-0 top-full z-30 mt-1 max-h-72 overflow-auto rounded-2xl border border-zinc-200 bg-white p-1.5 shadow-lg dark:border-zinc-700 dark:bg-zinc-900"
+                    >
+                      {searchMatches.map((match) => (
+                        <li key={match.id} role="option" aria-selected={false}>
+                          <button
+                            type="button"
+                            className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-sm text-zinc-700 transition hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-800"
+                            // mousedown 时就定位，避免 input blur 导致列表先关闭、click 丢失
+                            onMouseDown={(e) => {
+                              e.preventDefault();
+                              locateConfigTarget(match);
+                            }}
+                          >
+                            <span
+                              className={`inline-flex h-1.5 w-1.5 shrink-0 rounded-full ${
+                                getConfigListStatus(match) === "failed"
+                                  ? "bg-red-500"
+                                  : getConfigListStatus(match) === "disabled"
+                                    ? "bg-zinc-400"
+                                    : "bg-emerald-500"
+                              }`}
+                              aria-hidden
+                            />
+                            <span className="min-w-0 flex-1 truncate">{match.name}</span>
+                            {match.model ? (
+                              <span className="shrink-0 truncate text-xs text-zinc-400">{match.model}</span>
+                            ) : null}
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : null}
+                </div>
+                <button
+                  type="button"
+                  className={topBtnGhost}
+                  onClick={locateConfig}
+                  disabled={searchMatches.length === 0}
+                  title="定位到首个匹配的配置"
+                >
+                  <FaSearch aria-hidden />
+                  <span>定位</span>
+                </button>
+              </div>
             </div>
             {/* 模型分类筛选 */}
             <div className="flex w-full flex-wrap items-center gap-2">
@@ -4116,20 +4265,20 @@ export default function Home() {
 
           {activeList === "failed" && failedConfigs.length === 0 ? (
             <p className="shrink-0 text-sm text-zinc-500">暂无失败配置</p>
+          ) : activeList === "disabled" && disabledConfigs.length === 0 ? (
+            <p className="shrink-0 text-sm text-zinc-500">暂无禁用配置</p>
           ) : activeCount === 0 ? (
             <p className="shrink-0 text-sm text-zinc-500">
               {activeList === "failed"
                 ? "暂无失败配置"
-                : categoryFilter !== "all" || configSearch.trim()
-                  ? "当前筛选下无配置"
-                  : "暂无配置"}
+                : activeList === "disabled"
+                  ? "暂无禁用配置"
+                  : categoryFilter !== "all" || configSearch.trim()
+                    ? "当前筛选下无配置"
+                    : "暂无配置"}
             </p>
           ) : (
-            <ul
-              className={`grid max-h-full gap-2.5 overflow-y-auto pr-1 [-ms-overflow-style:none] [scrollbar-width:thin] ${
-                activeList === "failed" ? "grid-cols-[minmax(0,42rem)] justify-start" : "grid-cols-1"
-              }`}
-            >
+            <ul className="grid max-h-full min-w-0 grid-cols-1 gap-2.5 overflow-y-auto pr-1 [-ms-overflow-style:none] [scrollbar-width:thin]">
               {activeConfigs.map((item) => renderConfigCard(item))}
             </ul>
           )}
