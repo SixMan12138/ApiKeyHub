@@ -289,8 +289,9 @@ function compareConfigsByTestedAtDesc(left: KeyConfig, right: KeyConfig): number
   const rightTestedAt = parseConfigTimestamp(right.lastTest?.testedAt);
 
   if (leftTestedAt !== null || rightTestedAt !== null) {
-    if (leftTestedAt === null) return 1;
-    if (rightTestedAt === null) return -1;
+    // 新增/编辑后还没测试过的卡片没有识别状态，排到列表最前面便于一眼看到
+    if (leftTestedAt === null) return -1;
+    if (rightTestedAt === null) return 1;
     if (leftTestedAt !== rightTestedAt) return rightTestedAt - leftTestedAt;
   }
 
@@ -304,6 +305,34 @@ function normalizeBaseUrl(raw: string): string {
   if (!cleaned) return "";
   if (!/^https?:\/\//i.test(cleaned)) return `https://${cleaned}`;
   return cleaned;
+}
+
+// 批量测试/探测限流：免费公益站共享渠道有 RPM 限制，全量并发展发容易触发限流和排队超时
+const BATCH_TASK_CONCURRENCY = 2;
+const BATCH_TASK_STAGGER_MS = 1500;
+
+async function runBatchWithConcurrency(
+  items: KeyConfig[],
+  worker: (item: KeyConfig) => Promise<boolean>
+): Promise<boolean[]> {
+  const total = items.length;
+  if (total === 0) return [];
+
+  const results = new Array<boolean>(total).fill(false);
+  let cursor = 0;
+
+  const runLane = async (laneIndex: number) => {
+    // 各车道错开起步，避免同一秒内向同一批站点齐射
+    await new Promise((resolve) => window.setTimeout(resolve, laneIndex * BATCH_TASK_STAGGER_MS));
+    while (cursor < total) {
+      const index = cursor;
+      cursor += 1;
+      results[index] = await worker(items[index]);
+    }
+  };
+
+  await Promise.all(Array.from({ length: Math.min(BATCH_TASK_CONCURRENCY, total) }, (_, lane) => runLane(lane)));
+  return results;
 }
 
 function toOpenAIBaseUrl(raw: string): string {
@@ -3207,15 +3236,24 @@ export default function Home() {
     }
 
     try {
+      // 探测到的模型列表传给服务端做候选链（过滤掉画图/向量等非对话模型）
+      const fallbackModels = (item.probe?.supportedModels || [])
+        .map((model) => model.trim())
+        .filter((model) => model && isLikelyChatBenchmarkable(model))
+        .slice(0, 12);
       const response = await postJsonWithTimeout<OpenAIProxyTestResponse>(
         "/api/openai/test",
         {
           baseUrl,
           apiKey,
-          model: item.model || "gpt-4o-mini",
-          apiFormat: item.apiFormat || "auto"
+          // 模型留空时用探测到的推荐模型，服务端没有推荐会自行按候选链尝试，
+          // 避免写死 gpt-4o-mini 而渠道分组实际不提供导致误判失败
+          model: item.model.trim() || item.probe?.recommendedModel?.trim() || "",
+          apiFormat: item.apiFormat || "auto",
+          fallbackModels
         },
-        45000
+        // 服务端含瞬时重试和候选链，预算放宽到 8 分钟
+        480000
       );
 
       commitFinishedTestResult(item.id, response.result);
@@ -3527,7 +3565,8 @@ export default function Home() {
     const targetConfigs = activeConfigs;
     setProbingAll(true);
     setNotice(`开始探测当前${activeList === "failed" ? "失败" : "成功"}列表模型...`);
-    const result = await Promise.all(targetConfigs.map((item) => runModelProbe(item)));
+    // 低并发+错峰执行，避免并发齐射触发上游 RPM 限流
+    const result = await runBatchWithConcurrency(targetConfigs, runModelProbe);
     const okCount = result.filter(Boolean).length;
     setProbingAll(false);
     setNotice(`探测完成：成功 ${okCount}，失败 ${result.length - okCount}`);
@@ -3546,7 +3585,8 @@ export default function Home() {
     const targetConfigs = activeConfigs;
     setTestingAll(true);
     setNotice(`开始测试当前${activeList === "failed" ? "失败" : "成功"}列表配置...`);
-    const result = await Promise.all(targetConfigs.map((item) => runTest(item)));
+    // 低并发+错峰执行，避免并发齐射触发上游 RPM 限流与排队超时
+    const result = await runBatchWithConcurrency(targetConfigs, runTest);
     const passCount = result.filter(Boolean).length;
     const failCount = result.length - passCount;
     setTestingAll(false);

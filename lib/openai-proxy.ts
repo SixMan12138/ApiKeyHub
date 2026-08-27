@@ -7,9 +7,35 @@ import type {
   OpenAIProxyTestResponse,
 } from "@/lib/openai-proxy-types";
 
+import {
+  fetch as undiciFetch,
+  ProxyAgent,
+  type RequestInit as UndiciRequestInit,
+  type Response as UndiciResponse,
+} from "undici";
+
+const proxyUrl = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy;
+const proxyDispatcher = proxyUrl ? new ProxyAgent(proxyUrl) : undefined;
+
 const FAIL_TEXT = "主人，我不行了";
 const PASS_TEXT = "主人，快鞭策我吧";
 const MODEL_CANDIDATES = ["gpt-4.1-mini", "gpt-4o-mini", "gpt-4.1", "gpt-4o", "gpt-5-mini", "gpt-5"];
+// 推理模型（如 glm-5.x）常把小 token 预算全部耗在思考上，导致 content 为空被误判失败
+const TEST_MAX_TOKENS = 256;
+// 免费公益站高峰期排队 10~30 秒很常见，超时太短会把可用的站误判成超时
+const CHAT_HEADER_TIMEOUT_MS = 45_000;
+const STREAM_HEADER_TIMEOUT_MS = 60_000;
+const PROBE_ATTEMPT_TIMEOUT_MS = 15_000;
+const BENCH_TIMEOUT_MS = 30_000;
+// 流式建立连接后若长时间无新数据也按超时处理，避免无限等待
+const STREAM_IDLE_TIMEOUT_MS = 30_000;
+// 整体测试最长耗时：候选模型链 + 瞬时错误重试的总上限
+const TEST_OVERALL_DEADLINE_MS = 420_000;
+const TRANSIENT_RETRY_DELAY_MS = 10_000;
+// 候选链只在配置未指定模型时启用，避免死站点把一次测试拖得过久
+const MAX_MODEL_CANDIDATE_TRIES = 4;
+// 剩余时间不足这个预算时不再发起新一轮尝试（每个请求还会经历直连+代理两次超时）
+const MIN_ATTEMPT_BUDGET_MS = 25_000;
 
 type ModelTextResult = {
   ok: boolean;
@@ -153,6 +179,20 @@ function extractChatMessageContent(payload: unknown): unknown {
   return isRecord(message) ? message.content : undefined;
 }
 
+// 推理模型的思考内容也算"接口确实能出话"，否则 content 为空时会把可用站点误判失败
+function extractChatReasoningFallbackText(payload: unknown): string {
+  if (!isRecord(payload) || !Array.isArray(payload.choices)) return "";
+
+  const firstChoice = payload.choices[0];
+  if (!isRecord(firstChoice)) return "";
+
+  const message = firstChoice.message;
+  if (!isRecord(message)) return "";
+
+  const reasoning = message.reasoning_content;
+  return typeof reasoning === "string" ? reasoning.trim() : "";
+}
+
 function extractResponsesText(payload: unknown): string {
   if (!isRecord(payload)) return "";
 
@@ -238,18 +278,46 @@ function makeErrorDetail(error: unknown): string {
   return `${detail}；接口返回：${raw}`;
 }
 
-async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+async function fetchWithTimeout(url: string, init: UndiciRequestInit, timeoutMs: number): Promise<UndiciResponse> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    return await fetch(url, { ...init, signal: controller.signal });
+    try {
+      return await undiciFetch(url, {
+        ...init,
+        signal: controller.signal,
+      });
+    } catch (error) {
+      // Only transport failures reach here; successful non-2xx responses stay untouched.
+      // A direct-request timeout also falls back instead of spending another long OS-level timeout.
+      if (!proxyDispatcher) {
+        throw error;
+      }
+
+      const retryController = new AbortController();
+      const retryTimer = setTimeout(() => retryController.abort(), timeoutMs);
+
+      try {
+        return await undiciFetch(url, {
+          ...init,
+          signal: retryController.signal,
+          dispatcher: proxyDispatcher,
+        });
+      } finally {
+        clearTimeout(retryTimer);
+      }
+    }
   } finally {
     clearTimeout(timer);
   }
 }
 
-async function fetchJsonWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<unknown> {
+async function fetchJsonWithTimeout(
+  url: string,
+  init: UndiciRequestInit,
+  timeoutMs: number,
+): Promise<unknown> {
   const response = await fetchWithTimeout(url, init, timeoutMs);
   let payload: unknown = null;
 
@@ -275,6 +343,7 @@ async function requestModelText(
   model: string,
   prompt: string,
   maxTokens: number,
+  timeoutMs: number = CHAT_HEADER_TIMEOUT_MS,
 ): Promise<ModelTextResult> {
   const startedAt = performance.now();
 
@@ -293,7 +362,7 @@ async function requestModelText(
           max_tokens: maxTokens,
         }),
       },
-      12000,
+      timeoutMs,
     );
 
     let payload: unknown = null;
@@ -324,7 +393,11 @@ async function requestModelText(
     }
 
     const content = extractChatMessageContent(payload);
-    const text = toReadableResponseText(content);
+    let text = toReadableResponseText(content);
+
+    if (!text && !content) {
+      text = cleanMultilineText(extractChatReasoningFallbackText(payload));
+    }
 
     if (text || content) {
       return { ok: true, text, elapsedMs };
@@ -346,6 +419,7 @@ async function requestResponsesText(
   apiKey: string,
   model: string,
   prompt: string,
+  timeoutMs: number = CHAT_HEADER_TIMEOUT_MS,
 ): Promise<ModelTextResult> {
   const startedAt = performance.now();
 
@@ -363,7 +437,7 @@ async function requestResponsesText(
           input: prompt,
         }),
       },
-      12000,
+      timeoutMs,
     );
 
     let payload: unknown = null;
@@ -414,6 +488,7 @@ async function requestMessagesText(
   apiKey: string,
   model: string,
   prompt: string,
+  timeoutMs: number = CHAT_HEADER_TIMEOUT_MS,
 ): Promise<ModelTextResult> {
   const startedAt = performance.now();
 
@@ -430,10 +505,10 @@ async function requestMessagesText(
         body: JSON.stringify({
           model,
           messages: [{ role: "user", content: prompt }],
-          max_tokens: 48,
+          max_tokens: TEST_MAX_TOKENS,
         }),
       },
-      12000,
+      timeoutMs,
     );
 
     let payload: unknown = null;
@@ -483,6 +558,40 @@ function shouldTryResponsesFallback(error: string): boolean {
   return /404|not found|不存在|does not exist|unsupported/i.test(error);
 }
 
+// 这些错误说明"换一个候选模型可能有用"，如渠道里没有该模型、接口路径不存在
+// 超时也算（同站不同模型经常是不同渠道，主模型排队挂起时其他模型可能秒回）
+const CANDIDATE_SWITCH_PATTERN =
+  /404|not found|不存在|does not exist|unsupported|no available channel|无可用渠道|invalid\s*model|unknown\s*model|model_not_found|无权|权限不足|forbidden|not allowed|当前分组|超时|aborted|timed?[ _-]?out/i;
+
+function shouldTryNextCandidate(error: string): boolean {
+  return CANDIDATE_SWITCH_PATTERN.test(error);
+}
+
+// 瞬时错误（超时/限流/网络抖动）值得延迟后整体重试一次，不应直接判死
+const TRANSIENT_ERROR_PATTERN =
+  /超时|aborted|timed?[ _-]?out|rate.{0,3}limit|rpm|限流|fetch failed|connection|network|reset|econn|upstream|内部错误|internal error|服务器繁忙|请稍候|稍后再试|HTTP 50\d|未返回消息内容/i;
+
+function isTransientTestError(error: string): boolean {
+  if (!error) return false;
+  return TRANSIENT_ERROR_PATTERN.test(error);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// 多个候选都失败时，优先展示额度/鉴权这类决定性的原因，而不是候选模型的渠道噪声
+function pickMostUsefulTestError(errors: string[]): string {
+  const preferred = errors.find((item) => /额度|quota|余额|无效|unauthorized|api key|欠费|余额不足/i.test(item));
+  return preferred || errors[0] || "";
+}
+
+function makeAbortLikeError(message: string): Error {
+  const error = new Error(message);
+  error.name = "AbortError";
+  return error;
+}
+
 async function requestModelTextBestEffort(
   baseUrl: string,
   apiKey: string,
@@ -491,10 +600,11 @@ async function requestModelTextBestEffort(
   maxTokens: number,
   options?: {
     preferStream?: boolean;
+    timeoutMs?: number;
   },
 ): Promise<ModelTextResult> {
   if (options?.preferStream) {
-    const streamResponse = await requestModelTextStream(baseUrl, apiKey, model, prompt, maxTokens);
+    const streamResponse = await requestModelTextStream(baseUrl, apiKey, model, prompt, maxTokens, options.timeoutMs);
     if (streamResponse.ok) {
       return {
         ok: true,
@@ -503,7 +613,7 @@ async function requestModelTextBestEffort(
       };
     }
 
-    const chatResponse = await requestModelText(baseUrl, apiKey, model, prompt, maxTokens);
+    const chatResponse = await requestModelText(baseUrl, apiKey, model, prompt, maxTokens, options.timeoutMs);
     if (chatResponse.ok) return chatResponse;
 
     const shouldTryResponses =
@@ -512,7 +622,7 @@ async function requestModelTextBestEffort(
       shouldTryResponsesFallback(chatResponse.error || "");
 
     if (shouldTryResponses) {
-      const responsesResponse = await requestResponsesText(baseUrl, apiKey, model, prompt);
+      const responsesResponse = await requestResponsesText(baseUrl, apiKey, model, prompt, options.timeoutMs);
       if (responsesResponse.ok) return responsesResponse;
 
       return {
@@ -536,11 +646,11 @@ async function requestModelTextBestEffort(
     };
   }
 
-  const chatResponse = await requestModelText(baseUrl, apiKey, model, prompt, maxTokens);
+  const chatResponse = await requestModelText(baseUrl, apiKey, model, prompt, maxTokens, options?.timeoutMs);
   if (chatResponse.ok) return chatResponse;
 
   if (chatResponse.error === "未返回消息内容") {
-    const streamResponse = await requestModelTextStream(baseUrl, apiKey, model, prompt, maxTokens);
+    const streamResponse = await requestModelTextStream(baseUrl, apiKey, model, prompt, maxTokens, options?.timeoutMs);
     if (streamResponse.ok) {
       return {
         ok: true,
@@ -549,7 +659,7 @@ async function requestModelTextBestEffort(
       };
     }
 
-    const responsesResponse = await requestResponsesText(baseUrl, apiKey, model, prompt);
+    const responsesResponse = await requestResponsesText(baseUrl, apiKey, model, prompt, options?.timeoutMs);
     if (responsesResponse.ok) return responsesResponse;
 
     return {
@@ -566,7 +676,7 @@ async function requestModelTextBestEffort(
   }
 
   if (shouldTryResponsesFallback(chatResponse.error || "")) {
-    const responsesResponse = await requestResponsesText(baseUrl, apiKey, model, prompt);
+    const responsesResponse = await requestResponsesText(baseUrl, apiKey, model, prompt, options?.timeoutMs);
     if (responsesResponse.ok) return responsesResponse;
 
     return {
@@ -608,7 +718,7 @@ function extractStreamDeltaText(payload: unknown): string {
   return "";
 }
 
-async function readStreamError(response: Response): Promise<string> {
+async function readStreamError(response: UndiciResponse): Promise<string> {
   try {
     const payload = (await response.clone().json()) as unknown;
     const message = getErrorMessage(payload);
@@ -634,6 +744,7 @@ async function requestModelTextStream(
   model: string,
   prompt: string,
   maxTokens: number,
+  timeoutMs: number = STREAM_HEADER_TIMEOUT_MS,
 ): Promise<StreamTextResult> {
   const startedAt = performance.now();
 
@@ -653,7 +764,7 @@ async function requestModelTextStream(
           stream: true,
         }),
       },
-      20000,
+      timeoutMs,
     );
 
     if (!response.ok) {
@@ -680,8 +791,26 @@ async function requestModelTextStream(
     let collectedText = "";
     let firstTokenMs: number | undefined;
 
+    // 读流阶段如果上游长时间不发新数据，主动中断而不是无限等待
+    const readWithIdleWatchdog = async () => {
+      let idleTimer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          reader.read(),
+          new Promise<never>((_, reject) => {
+            idleTimer = setTimeout(
+              () => reject(makeAbortLikeError("流式响应空闲超时")),
+              STREAM_IDLE_TIMEOUT_MS,
+            );
+          }),
+        ]);
+      } finally {
+        clearTimeout(idleTimer);
+      }
+    };
+
     while (true) {
-      const { value, done } = await reader.read();
+      const { value, done } = await readWithIdleWatchdog();
       if (done) break;
 
       buffer += decoder.decode(value, { stream: true });
@@ -744,7 +873,17 @@ function chooseRecommendedModel(currentModel: string, models: string[]): string 
     if (normalized.includes(candidate)) return candidate;
   }
 
-  return normalized[0] || "";
+  // 站点可能把画图/向量等非对话模型排在列表前面，推荐时优先挑对话类模型
+  return normalized.find(isChatCapableModelName) || normalized[0] || "";
+}
+
+const NON_CHAT_MODEL_PATTERN =
+  /embedding|\bembed|rerank|whisper|\btts\b|transcri|image|\bflux\b|stable-?diffusion|sdxl|\bvl\b|\bvlm\b|moderation|dall[- ]?e|\bvideo\b|\baudio\b/i;
+
+function isChatCapableModelName(model: string): boolean {
+  const normalized = model.trim();
+  if (!normalized) return false;
+  return !NON_CHAT_MODEL_PATTERN.test(normalized);
 }
 
 function extractModelsFromResponse(input: unknown): string[] {
@@ -782,43 +921,107 @@ export async function runOpenAITest(input: OpenAIProxyTestRequest): Promise<Open
     };
   }
 
-  const model = input.model?.trim() || "gpt-4o-mini";
   const apiFormat = input.apiFormat || "auto";
-  const attempts: SourcedModelTextResult[] = [];
+  const requestedModel = input.model?.trim() || "";
+  // 配置了模型就只测它；没配置时优先用探测到的站点模型，再退回内置候选链，
+  // 避免写死 gpt-4o-mini 撞上渠道分组不提供的坑
+  const chatCapableFallbacks = (input.fallbackModels || []).filter(isChatCapableModelName);
+  const candidateModels = uniqueStrings([
+    ...(requestedModel ? [requestedModel] : []),
+    ...chatCapableFallbacks,
+    ...(requestedModel ? [] : MODEL_CANDIDATES),
+  ]).slice(0, MAX_MODEL_CANDIDATE_TRIES);
 
-  if (apiFormat === "chat") {
-    const chatResponse = await requestModelText(baseUrl, apiKey, model, prompt, 48);
-    attempts.push({ ...chatResponse, source: "chat" });
-  } else if (apiFormat === "responses") {
-    const responsesResponse = await requestResponsesText(baseUrl, apiKey, model, prompt);
-    attempts.push({ ...responsesResponse, source: "responses" });
-  } else if (apiFormat === "messages") {
-    const messagesResponse = await requestMessagesText(baseUrl, apiKey, model, prompt);
-    attempts.push({ ...messagesResponse, source: "messages" });
-  } else {
-    const streamResponse = await requestModelTextStream(baseUrl, apiKey, model, prompt, 48);
-    attempts.push({ ...streamResponse, source: "stream" });
+  async function runCandidateAttempts(model: string, budgetMs: number): Promise<SourcedModelTextResult[]> {
+    const attempts: SourcedModelTextResult[] = [];
+    const chatTimeoutMs = Math.min(CHAT_HEADER_TIMEOUT_MS, budgetMs);
+    const streamTimeoutMs = Math.min(STREAM_HEADER_TIMEOUT_MS, budgetMs);
 
-    if (!(streamResponse.ok && !isLowSignalResponseText(streamResponse.text))) {
-      const chatResponse = await requestModelText(baseUrl, apiKey, model, prompt, 48);
+    if (apiFormat === "chat") {
+      const chatResponse = await requestModelText(baseUrl, apiKey, model, prompt, TEST_MAX_TOKENS, chatTimeoutMs);
       attempts.push({ ...chatResponse, source: "chat" });
+    } else if (apiFormat === "responses") {
+      const responsesResponse = await requestResponsesText(baseUrl, apiKey, model, prompt, chatTimeoutMs);
+      attempts.push({ ...responsesResponse, source: "responses" });
+    } else if (apiFormat === "messages") {
+      const messagesResponse = await requestMessagesText(baseUrl, apiKey, model, prompt, chatTimeoutMs);
+      attempts.push({ ...messagesResponse, source: "messages" });
+    } else {
+      const streamResponse = await requestModelTextStream(baseUrl, apiKey, model, prompt, TEST_MAX_TOKENS, streamTimeoutMs);
+      attempts.push({ ...streamResponse, source: "stream" });
 
-      const shouldTryResponses =
-        !chatResponse.ok ||
-        isLowSignalResponseText(chatResponse.text) ||
-        shouldTryResponsesFallback(streamResponse.error || "") ||
-        shouldTryResponsesFallback(chatResponse.error || "");
+      if (!(streamResponse.ok && !isLowSignalResponseText(streamResponse.text))) {
+        const chatResponse = await requestModelText(baseUrl, apiKey, model, prompt, TEST_MAX_TOKENS, chatTimeoutMs);
+        attempts.push({ ...chatResponse, source: "chat" });
 
-      if (shouldTryResponses) {
-        const responsesResponse = await requestResponsesText(baseUrl, apiKey, model, prompt);
-        attempts.push({ ...responsesResponse, source: "responses" });
+        const shouldTryResponses =
+          !chatResponse.ok ||
+          isLowSignalResponseText(chatResponse.text) ||
+          shouldTryResponsesFallback(streamResponse.error || "") ||
+          shouldTryResponsesFallback(chatResponse.error || "");
+
+        if (shouldTryResponses) {
+          const responsesResponse = await requestResponsesText(baseUrl, apiKey, model, prompt, chatTimeoutMs);
+          attempts.push({ ...responsesResponse, source: "responses" });
+        }
       }
     }
+
+    return attempts;
   }
 
-  const bestResponse = pickBestTextResult(attempts);
+  async function evaluateCandidates(): Promise<{
+    best?: SourcedModelTextResult;
+    errors: string[];
+    sawTransientError: boolean;
+    attempts: SourcedModelTextResult[];
+  }> {
+    let lastAttempts: SourcedModelTextResult[] = [];
+    const errors: string[] = [];
+    let sawTransientError = false;
 
-  if (bestResponse) {
+    for (let index = 0; index < candidateModels.length; index += 1) {
+      const candidate = candidateModels[index];
+      const budgetMs = deadlineAt - Date.now();
+      if (budgetMs < MIN_ATTEMPT_BUDGET_MS) break;
+
+      // 预算按剩余候选数均摊，避免主模型把整体时限吃光后其余候选全被跳过
+      const remainingCandidates = candidateModels.length - index;
+      const shareMs = Math.max(MIN_ATTEMPT_BUDGET_MS, Math.floor(budgetMs / remainingCandidates));
+
+      const attempts = await runCandidateAttempts(candidate, shareMs);
+      lastAttempts = attempts;
+
+      const chainErrors = uniqueStrings(attempts.map((item) => item.error || ""));
+      if (chainErrors[0]) {
+        errors.push(chainErrors[0]);
+        if (isTransientTestError(chainErrors[0])) sawTransientError = true;
+      }
+
+      const bestForCandidate = pickBestTextResult(attempts);
+      if (bestForCandidate) return { best: bestForCandidate, errors, sawTransientError, attempts };
+
+      const nextCandidateWorthTrying =
+        index < candidateModels.length - 1 &&
+        Date.now() < deadlineAt &&
+        shouldTryNextCandidate(chainErrors.join("；"));
+      if (!nextCandidateWorthTrying) break;
+    }
+
+    return { best: undefined, errors, sawTransientError, attempts: lastAttempts };
+  }
+
+  const deadlineAt = Date.now() + TEST_OVERALL_DEADLINE_MS;
+  let evaluation = await evaluateCandidates();
+
+  // 瞬时错误（超时/限流/网络抖动）不直接判死，延迟后整体再试一次
+  if (!evaluation.best && evaluation.sawTransientError && Date.now() < deadlineAt) {
+    await delay(TRANSIENT_RETRY_DELAY_MS);
+    evaluation = await evaluateCandidates();
+  }
+
+  if (evaluation.best) {
+    const bestResponse = evaluation.best;
     const sourceLabel =
       bestResponse.source === "stream"
         ? "流式"
@@ -840,14 +1043,18 @@ export async function runOpenAITest(input: OpenAIProxyTestRequest): Promise<Open
     };
   }
 
-  const response = attempts[0];
+  const detail =
+    pickMostUsefulTestError(uniqueStrings(evaluation.errors)) ||
+    evaluation.attempts[0]?.error ||
+    uniqueStrings(evaluation.attempts.map((item) => item.error || ""))[0] ||
+    "未返回消息内容";
 
   return {
     ok: false,
     result: {
       status: "error",
       message: FAIL_TEXT,
-      detail: response?.error || uniqueStrings(attempts.map((item) => item.error || ""))[0] || "未返回消息内容",
+      detail,
       testedAt,
     },
   };
@@ -905,7 +1112,9 @@ export async function runOpenAIProbe(input: OpenAIProxyProbeRequest): Promise<Op
   let fallbackError = "";
 
   for (const candidate of MODEL_CANDIDATES) {
-    const response = await requestModelTextBestEffort(baseUrl, apiKey, candidate, "你好，请回复：ok", 12);
+    const response = await requestModelTextBestEffort(baseUrl, apiKey, candidate, "你好，请回复：ok", 12, {
+      timeoutMs: PROBE_ATTEMPT_TIMEOUT_MS,
+    });
     if (response.ok) {
       supportedModels.push(candidate);
       continue;
@@ -964,6 +1173,7 @@ export async function runOpenAIBenchmarkRound(
     model,
     "Reply with exactly OK. Do not add anything else.",
     8,
+    BENCH_TIMEOUT_MS,
   );
 
   if (streamedResponse.ok) {
@@ -982,6 +1192,7 @@ export async function runOpenAIBenchmarkRound(
     model,
     "Reply with exactly OK. Do not add anything else.",
     8,
+    { timeoutMs: BENCH_TIMEOUT_MS },
   );
 
   if (fallbackResponse.ok) {

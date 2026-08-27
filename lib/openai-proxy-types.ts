@@ -8,6 +8,8 @@ export type OpenAIProxyBaseRequest = {
 export type OpenAIProxyTestRequest = OpenAIProxyBaseRequest & {
   model?: string;
   apiFormat?: OpenAIProxyApiFormat;
+  // 探测到的站点模型列表：配置未填模型时按序尝试，避免拿写死的默认模型撞渠道分组
+  fallbackModels?: string[];
 };
 
 export type OpenAIProxyTestResponse = {
