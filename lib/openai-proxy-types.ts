@@ -18,6 +18,8 @@ export type OpenAIProxyTestResponse = {
     status: "success" | "error";
     message: string;
     detail?: string;
+    // 候选链命中时记录实际通过的模型，可能不同于配置里的模型
+    model?: string;
     responseText?: string;
     responseSource?: "stream" | "chat" | "responses" | "messages";
     testedAt: string;

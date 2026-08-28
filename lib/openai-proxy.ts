@@ -972,6 +972,7 @@ export async function runOpenAITest(input: OpenAIProxyTestRequest): Promise<Open
 
   async function evaluateCandidates(): Promise<{
     best?: SourcedModelTextResult;
+    winnerModel?: string;
     errors: string[];
     sawTransientError: boolean;
     attempts: SourcedModelTextResult[];
@@ -999,7 +1000,9 @@ export async function runOpenAITest(input: OpenAIProxyTestRequest): Promise<Open
       }
 
       const bestForCandidate = pickBestTextResult(attempts);
-      if (bestForCandidate) return { best: bestForCandidate, errors, sawTransientError, attempts };
+      if (bestForCandidate) {
+        return { best: bestForCandidate, winnerModel: candidate, errors, sawTransientError, attempts };
+      }
 
       const nextCandidateWorthTrying =
         index < candidateModels.length - 1 &&
@@ -1036,6 +1039,7 @@ export async function runOpenAITest(input: OpenAIProxyTestRequest): Promise<Open
         status: "success",
         message: PASS_TEXT,
         detail: bestResponse.text ? `接口连通，已收到对“你是谁”的简短回复（${sourceLabel}）` : "返回消息正常",
+        model: evaluation.winnerModel,
         responseText: bestResponse.text || undefined,
         responseSource: bestResponse.source,
         testedAt,

@@ -49,6 +49,8 @@ type KeyConfig = {
   model: string;
   apiFormat?: OpenAIProxyApiFormat;
   listStatus?: "success" | "failed" | "disabled";
+  // 测试策略：chain=失败时沿站点模型列表找可用模型（默认）；single=只测选中的模型
+  testMode?: "chain" | "single";
   createdAt: string;
   sourceMeta?: {
     kind: "manual" | "cc-switch-provider" | "cc-switch-deeplink";
@@ -65,6 +67,7 @@ type KeyConfig = {
     status: "success" | "error";
     message: string;
     detail?: string;
+    model?: string;
     responseText?: string;
     responseSource?: "stream" | "chat" | "responses" | "messages";
     testedAt: string;
@@ -94,6 +97,7 @@ type TestResult = {
   status: TestStatus;
   message: string;
   detail?: string;
+  model?: string;
   responseText?: string;
   responseSource?: "stream" | "chat" | "responses" | "messages";
   testedAt?: string;
@@ -189,7 +193,7 @@ function normalizeApiFormat(input: unknown): OpenAIProxyApiFormat {
   if (input === "chat" || input === "responses" || input === "messages" || input === "auto") return input;
   return "auto";
 }
-type ModelCategory = "gpt" | "claude" | "glm" | "deepseek" | "gemini" | "grok" | "mimo" | "other";
+type ModelCategory = "gpt" | "claude" | "glm" | "deepseek" | "gemini" | "grok" | "mimo" | "moonshot" | "minimax" | "other";
 type ModelCategoryFilter = ModelCategory | "all";
 const MODEL_CATEGORY_RULES: { category: ModelCategory; patterns: RegExp[] }[] = [
   { category: "gpt", patterns: [/\bgpt\b/i, /\bo1\b/i, /\bo3\b/i, /\bo4\b/i, /openai/i, /chatgpt/i] },
@@ -198,7 +202,9 @@ const MODEL_CATEGORY_RULES: { category: ModelCategory; patterns: RegExp[] }[] = 
   { category: "deepseek", patterns: [/deepseek/i] },
   { category: "gemini", patterns: [/gemini/i] },
   { category: "grok", patterns: [/grok/i, /\bxai\b/i] },
-  { category: "mimo", patterns: [/mimo/i] }
+  { category: "mimo", patterns: [/mimo/i] },
+  { category: "moonshot", patterns: [/moonshot/i, /\bkimi\b/i] },
+  { category: "minimax", patterns: [/minimax/i, /\babab/i] }
 ];
 const MODEL_CATEGORY_OPTIONS: { value: ModelCategoryFilter; label: string }[] = [
   { value: "all", label: "全部" },
@@ -209,6 +215,8 @@ const MODEL_CATEGORY_OPTIONS: { value: ModelCategoryFilter; label: string }[] = 
   { value: "gemini", label: "Gemini" },
   { value: "grok", label: "Grok" },
   { value: "mimo", label: "Mimo" },
+  { value: "moonshot", label: "Moonshot" },
+  { value: "minimax", label: "MiniMax" },
   { value: "other", label: "其他" }
 ];
 function inferModelCategory(model: string): ModelCategory {
@@ -1010,6 +1018,7 @@ function normalizeFinishedTestResult(input: unknown): FinishedTestResult | undef
       ? input.responseSource
       : undefined;
   const detail = rawDetail && !legacyResponseText ? cleanOneLineText(rawDetail, 300) : responseText ? "接口连通，已收到模型回复" : "";
+  const testedModel = typeof input.model === "string" ? input.model.trim() : "";
   const testedAt = safeDateToIso(input.testedAt);
 
   if (!testedAt) return undefined;
@@ -1018,6 +1027,7 @@ function normalizeFinishedTestResult(input: unknown): FinishedTestResult | undef
     status,
     message: message || (status === "success" ? PASS_TEXT : FAIL_TEXT),
     detail: detail || undefined,
+    model: testedModel || undefined,
     responseText: responseText || undefined,
     responseSource,
     testedAt
@@ -1511,12 +1521,13 @@ function normalizeStoredConfigItem(input: unknown, index: number): KeyConfig | u
           : lastTest?.status === "error"
             ? "failed"
             : "success";
+  const testMode: KeyConfig["testMode"] = input.testMode === "single" ? "single" : "chain";
   const hasCoreValue = Boolean(rawName || baseUrl || apiKey || model || probe || lastTest || benchmarks);
 
   if (!hasCoreValue) return undefined;
 
   const name = rawName || makeDefaultName(index + 1);
-  return { id, name, baseUrl, apiKey, model, apiFormat, listStatus, createdAt, sourceMeta, probe, lastTest, benchmarks };
+  return { id, name, baseUrl, apiKey, model, apiFormat, listStatus, testMode, createdAt, sourceMeta, probe, lastTest, benchmarks };
 }
 
 function toStoredConfigCandidates(parsed: unknown): unknown[] {
@@ -1776,6 +1787,18 @@ export default function Home() {
     if (item.listStatus === "failed" || item.listStatus === "success") return item.listStatus;
     return item.lastTest?.status === "error" ? "failed" : "success";
   }
+  function getConfigTestMode(item: KeyConfig): "chain" | "single" {
+    return item.testMode === "single" ? "single" : "chain";
+  }
+  function setConfigTestMode(id: string, mode: "chain" | "single") {
+    setConfigs((prev) => prev.map((item) => (item.id === id ? { ...item, testMode: mode } : item)));
+    const target = configs.find((item) => item.id === id);
+    setNotice(
+      mode === "single"
+        ? `已切换为仅测选中：${target?.name || ""} 只测试配置/推荐的模型`
+        : `已切换为循环测试：${target?.name || ""} 失败时沿站点模型列表自动匹配`
+    );
+  }
   const sortedConfigs = [...configs].sort(compareConfigsByTestedAtDesc);
   const failedConfigs = sortedConfigs.filter((item) => getConfigListStatus(item) === "failed");
   const disabledConfigs = sortedConfigs.filter((item) => getConfigListStatus(item) === "disabled");
@@ -1861,10 +1884,23 @@ export default function Home() {
     setCollapsedIds((prev) => ({ ...prev, ...Object.fromEntries(activeConfigs.map((item) => [item.id, false])) }));
   }
 
+  // 全局一键切换测试方式：只要还有卡片是循环测试，点击即全部设为仅测选中；反之全部恢复循环测试
+  function toggleAllTestModes() {
+    const allSingle = configs.every((item) => getConfigTestMode(item) === "single");
+    const nextMode: "chain" | "single" = allSingle ? "chain" : "single";
+    setConfigs((prev) => prev.map((item) => ({ ...item, testMode: nextMode })));
+    setNotice(nextMode === "single" ? "已将全部卡片设为仅测选中" : "已将全部卡片设为循环测试");
+  }
+
   // 共享卡片渲染：成功 / 失败 / 禁用列表共用同一函数，折叠/小框设计一致复用
   function renderConfigCard(item: KeyConfig) {
     const testing = loadingMap[item.id];
     const result = getConfigResult(item);
+    // 候选链命中时实际通过的模型可能与配置的不同；成功时展示真实命中的模型，避免误导
+    const hitModel =
+      result.status === "success" && result.model && result.model.trim() !== item.model.trim()
+        ? result.model.trim()
+        : "";
     const probe = probeMap[item.id] || item.probe || defaultProbeResult();
     const isEditing = editingId === item.id;
     const isEditingModel = editingModelId === item.id;
@@ -1998,6 +2034,26 @@ export default function Home() {
                     <>
                       <button
                         type="button"
+                        className={`${smallBtn} ${
+                          getConfigTestMode(item) === "single"
+                            ? "border-amber-300 text-amber-700 dark:border-amber-700 dark:text-amber-400"
+                            : ""
+                        }`}
+                        onClick={() =>
+                          setConfigTestMode(item.id, getConfigTestMode(item) === "single" ? "chain" : "single")
+                        }
+                        title={
+                          getConfigTestMode(item) === "single"
+                            ? "当前仅测选中的模型，点击切换为循环测试"
+                            : "当前失败时沿模型列表循环匹配，点击切换为仅测选中"
+                        }
+                        aria-label="切换测试方式"
+                      >
+                        <FaExchangeAlt aria-hidden />
+                        <span>{getConfigTestMode(item) === "single" ? "仅测选中" : "循环测试"}</span>
+                      </button>
+                      <button
+                        type="button"
                         className={smallBtn}
                         onClick={() => testConfig(item)}
                         disabled={testing}
@@ -2064,6 +2120,15 @@ export default function Home() {
                   <FaTag className="shrink-0 text-zinc-400 dark:text-zinc-500" aria-hidden />
                   <span className="truncate">{item.model || "（未设置）"}</span>
                 </span>
+                {hitModel ? (
+                  <span
+                    className="inline-flex min-w-0 max-w-[26vw] shrink items-center gap-1 truncate rounded-lg border border-emerald-200 bg-emerald-50 px-2 py-1 text-xs font-medium text-emerald-700 dark:border-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300"
+                    title={`实际命中模型：${hitModel}（候选链自动匹配）`}
+                  >
+                    <FaCheckCircle className="shrink-0" aria-hidden />
+                    <span className="truncate">{hitModel}</span>
+                  </span>
+                ) : null}
                 {result.detail ? (
                   <span
                     className="inline-flex min-w-0 flex-1 items-center gap-1 truncate rounded-lg border border-zinc-200 bg-zinc-50 px-2 py-1 text-xs text-zinc-600 dark:border-zinc-700 dark:bg-zinc-800/60 dark:text-zinc-300"
@@ -2198,6 +2263,20 @@ export default function Home() {
 
                   <div className="grid gap-1 sm:grid-cols-[90px_1fr] sm:items-start sm:gap-2">
                     <span className="inline-flex items-center gap-1 text-xs text-zinc-500">
+                      <FaExchangeAlt aria-hidden /> 测试方式
+                    </span>
+                    <select
+                      className={`${inputClass} max-w-md`}
+                      value={getConfigTestMode(item)}
+                      onChange={(e) => setConfigTestMode(item.id, e.target.value === "single" ? "single" : "chain")}
+                    >
+                      <option value="chain">循环测试 — 失败时沿站点模型列表自动匹配可用模型</option>
+                      <option value="single">仅测选中 — 只测试配置/推荐的模型</option>
+                    </select>
+                  </div>
+
+                  <div className="grid gap-1 sm:grid-cols-[90px_1fr] sm:items-start sm:gap-2">
+                    <span className="inline-flex items-center gap-1 text-xs text-zinc-500">
                       <FaVial aria-hidden /> 状态
                     </span>
                     <div className="grid gap-1">
@@ -2206,6 +2285,14 @@ export default function Home() {
                       >
                         <StatusIcon status={result.status} />
                         <span>{result.message}</span>
+                        {hitModel ? (
+                          <span
+                            className="rounded-full border border-emerald-300 bg-white/70 px-2 py-0.5 text-[10px] font-medium text-emerald-700"
+                            title="候选链自动匹配到可用模型"
+                          >
+                            实际命中：{hitModel}
+                          </span>
+                        ) : null}
                       </span>
                       {result.status === "error" && result.detail ? (
                         <details className="w-full rounded-lg border border-red-100 bg-red-50/50 px-2 py-1.5 text-xs text-red-800">
@@ -3236,11 +3323,14 @@ export default function Home() {
     }
 
     try {
-      // 探测到的模型列表传给服务端做候选链（过滤掉画图/向量等非对话模型）
-      const fallbackModels = (item.probe?.supportedModels || [])
-        .map((model) => model.trim())
-        .filter((model) => model && isLikelyChatBenchmarkable(model))
-        .slice(0, 12);
+      // 循环测试：把探测到的模型列表传给服务端做候选链；仅测选中：不传候选链，只测配置/推荐的模型
+      const chainMode = getConfigTestMode(item) === "chain";
+      const fallbackModels = chainMode
+        ? (item.probe?.supportedModels || [])
+            .map((model) => model.trim())
+            .filter((model) => model && isLikelyChatBenchmarkable(model))
+            .slice(0, 12)
+        : [];
       const response = await postJsonWithTimeout<OpenAIProxyTestResponse>(
         "/api/openai/test",
         {
@@ -4204,6 +4294,29 @@ export default function Home() {
                 <FaExpandArrowsAlt aria-hidden />
                 <span>打开全部</span>
               </button>
+              {(() => {
+                const allSingle = configs.length > 0 && configs.every((item) => getConfigTestMode(item) === "single");
+                return (
+                  <button
+                    type="button"
+                    className={`${topBtnGhost} ${
+                      configs.length === 0 || allSingle
+                        ? ""
+                        : "border-amber-300 text-amber-700 dark:border-amber-700 dark:text-amber-400"
+                    }`}
+                    onClick={toggleAllTestModes}
+                    disabled={configs.length === 0}
+                    title={
+                      allSingle
+                        ? "当前全部为仅测选中，点击一键恢复循环测试"
+                        : "点击把所有卡片一键设为仅测选中（不再自动换模型救场）"
+                    }
+                  >
+                    <FaExchangeAlt aria-hidden />
+                    <span>{allSingle ? "全部循环" : "全部单测"}</span>
+                  </button>
+                );
+              })()}
 
               <div
                 className="relative ml-auto flex min-w-0 w-full max-w-md items-center gap-2 sm:w-auto sm:min-w-[16rem]"
