@@ -10,6 +10,9 @@ export type OpenAIProxyTestRequest = OpenAIProxyBaseRequest & {
   apiFormat?: OpenAIProxyApiFormat;
   // 探测到的站点模型列表：配置未填模型时按序尝试，避免拿写死的默认模型撞渠道分组
   fallbackModels?: string[];
+  // 循环测试逐模型扫描：只测这一个模型，跳过瞬时错误整体重试并收紧总时限，
+  // 避免个别慢模型把整轮扫描拖垮、也避免同一站点被连续打满 RPM
+  sweep?: boolean;
 };
 
 export type OpenAIProxyTestResponse = {
@@ -23,6 +26,8 @@ export type OpenAIProxyTestResponse = {
     responseText?: string;
     responseSource?: "stream" | "chat" | "responses" | "messages";
     testedAt: string;
+    // 本次测试（含候选链与重试）的总耗时，供循环测试展示
+    elapsedMs?: number;
   };
 };
 

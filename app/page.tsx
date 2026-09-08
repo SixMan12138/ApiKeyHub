@@ -17,16 +17,20 @@ import {
   FaExchangeAlt,
   FaExpandArrowsAlt,
   FaFileExport,
+  FaFire,
   FaInfoCircle,
   FaKey,
   FaLink,
+  FaListAlt,
   FaMagic,
   FaMoon,
   FaPaste,
+  FaPlus,
   FaQuestionCircle,
   FaSave,
   FaSearch,
   FaSpinner,
+  FaStopCircle,
   FaSun,
   FaTag,
   FaTimesCircle,
@@ -49,8 +53,12 @@ type KeyConfig = {
   model: string;
   apiFormat?: OpenAIProxyApiFormat;
   listStatus?: "success" | "failed" | "disabled";
-  // 测试策略：chain=失败时沿站点模型列表找可用模型（默认）；single=只测选中的模型
+  // 测试策略：chain=循环测试，按频率把整份模型列表逐个测一遍；single=只测选中的模型
   testMode?: "chain" | "single";
+  // 该供应商循环测试两次模型之间的最小间隔（秒）；留空跟随全局默认值
+  cycleIntervalSec?: number;
+  // 循环测试的逐模型明细，供卡片「测试列表」弹窗查看
+  modelTests?: FinishedModelTestItem[];
   createdAt: string;
   sourceMeta?: {
     kind: "manual" | "cc-switch-provider" | "cc-switch-deeplink";
@@ -71,6 +79,7 @@ type KeyConfig = {
     responseText?: string;
     responseSource?: "stream" | "chat" | "responses" | "messages";
     testedAt: string;
+    elapsedMs?: number;
   };
   benchmarks?: Record<string, FinishedModelBenchmarkResult>;
 };
@@ -103,6 +112,20 @@ type TestResult = {
   testedAt?: string;
 };
 type FinishedTestResult = NonNullable<KeyConfig["lastTest"]>;
+// 循环测试的逐模型结果；pending 表示排队中或正在测
+type ModelTestItem = {
+  model: string;
+  status: TestStatus;
+  detail?: string;
+  elapsedMs?: number;
+  responseSource?: "stream" | "chat" | "responses" | "messages";
+  testedAt?: string;
+};
+type FinishedModelTestItem = ModelTestItem & {
+  status: "success" | "error";
+  testedAt: string;
+};
+type ModelTestFilter = "all" | "success" | "error";
 type ProbeResult = {
   status: TestStatus;
   supportedModels: string[];
@@ -183,6 +206,15 @@ const NOTICE_SUCCESS_KEYWORDS = ["成功", "完成", "已", "通过"];
 const PASS_TEXT = "主人，快鞭策我吧";
 const FAIL_TEXT = "主人，我不行了";
 const DEFAULT_BENCHMARK_ROUNDS = 2;
+// 循环测试同一供应商的默认节流间隔：20 秒测一个模型，照顾有 RPM 限制的站点
+const DEFAULT_CYCLE_INTERVAL_SEC = 20;
+const CYCLE_INTERVAL_STORAGE_KEY = "ai-key-vault-cycle-interval-v1";
+const CYCLE_INTERVAL_MIN_SEC = 1;
+const CYCLE_INTERVAL_MAX_SEC = 600;
+// 单轮循环测试最多扫描的模型数，避免个别站点 /models 返回上千条把任务挂死
+const MAX_CYCLE_MODELS = 200;
+// 循环测试单个模型的请求超时：服务端扫描模式预算 100 秒，这里留出余量
+const CYCLE_MODEL_REQUEST_TIMEOUT_MS = 150_000;
 const API_FORMAT_OPTIONS: { value: OpenAIProxyApiFormat; label: string; hint: string }[] = [
   { value: "auto", label: "自动兼容", hint: "优先 Chat Completions，必要时 fallback 到 Responses" },
   { value: "chat", label: "/v1/chat/completions", hint: "OpenAI 兼容中转站最常见" },
@@ -224,6 +256,162 @@ function inferModelCategory(model: string): ModelCategory {
   if (!m) return "other";
   const hit = MODEL_CATEGORY_RULES.find((r) => r.patterns.some((p) => p.test(m)));
   return hit ? hit.category : "other";
+}
+
+// ---------- 热点模型：循环测试只测这份列表命中的模型，避免整表扫描白烧 token ----------
+const MAX_HOT_MODELS = 200;
+// 内置候选：站点还没识别过模型时也能先选着；已识别到的真实模型会优先展示并排在前
+const HOT_MODEL_SEED: string[] = [
+  "gpt-5.1",
+  "gpt-5.1-mini",
+  "gpt-5",
+  "o4-mini",
+  "claude-sonnet-4-5",
+  "claude-opus-4-5",
+  "claude-haiku-4-5",
+  "deepseek-chat",
+  "deepseek-reasoner",
+  "deepseek-v3.2",
+  "glm-4.6",
+  "glm-5",
+  "gemini-3-pro",
+  "gemini-3-flash",
+  "grok-4",
+  "kimi-k2",
+  "minimax-m2",
+  "qwen3-max",
+  "mimo-v2-flash"
+];
+// 热点弹窗按厂家分组，比列表筛选多拆一个 Qwen，避免主力国产模型挤进「其他」
+type HotVendor = ModelCategory | "qwen";
+const HOT_MODEL_VENDOR_ORDER: { vendor: HotVendor; label: string }[] = [
+  { vendor: "gpt", label: "OpenAI / GPT" },
+  { vendor: "claude", label: "Anthropic / Claude" },
+  { vendor: "deepseek", label: "DeepSeek" },
+  { vendor: "glm", label: "智谱 / GLM" },
+  { vendor: "gemini", label: "Google / Gemini" },
+  { vendor: "grok", label: "xAI / Grok" },
+  { vendor: "moonshot", label: "Moonshot / Kimi" },
+  { vendor: "minimax", label: "MiniMax" },
+  { vendor: "mimo", label: "小米 / Mimo" },
+  { vendor: "qwen", label: "阿里 / Qwen" },
+  { vendor: "other", label: "其他" }
+];
+function inferHotVendor(model: string): HotVendor {
+  if (/\bqwen\b/i.test(model) || /qwen/i.test(model) || /tongyi/i.test(model)) return "qwen";
+  return inferModelCategory(model);
+}
+// 中转站模型名常见形态：org/name、下划线、日期后缀，比对前先归一化
+function normalizeModelKey(raw: string): string {
+  return raw
+    .trim()
+    .toLowerCase()
+    .replace(/^[a-z0-9][a-z0-9._-]*?\//, "")
+    .replace(/_/g, "-")
+    .replace(/[^a-z0-9.+-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+function hotModelMatches(hotName: string, siteName: string): boolean {
+  const hot = normalizeModelKey(hotName);
+  const site = normalizeModelKey(siteName);
+  if (!hot || !site) return false;
+
+  const hotVendor = inferHotVendor(hotName);
+  const siteVendor = inferHotVendor(siteName);
+  // 厂家明确且不同就判不匹配，避免 gpt 的热点项误命中别的家的同名片段
+  if (hotVendor !== "other" && siteVendor !== "other" && hotVendor !== siteVendor) return false;
+
+  // 只允许「站点名比热点名更具体」这一个方向：热点选 glm-5 可以命中站点的 glm-5.2，
+  // 但反过来热点选了 gpt-5.1-mini，就不该把站点上更泛的 gpt-5.1 也算命中——那是另一个模型
+  if (hot === site || site.includes(hot)) return true;
+
+  // 再补一层「去连字符」比对：同一族模型在不同站点会写成 qwen3.8 / qwen-3.8，
+  // 少了这层就会出现「热点明明选了，那个站点却测不到」
+  return site.replace(/-/g, "").includes(hot.replace(/-/g, ""));
+}
+// 一条热点要测站点上所有「真正不同」的变体。霸气公益上 qwen3.8 同时有 27b 和 flash 两个模型，
+// 只取一个测就会漏掉另一个；变体之间用 modelVariantKey 去重，日期快照/免费标记不算不同模型。
+function pickHotMatchedModels(siteModels: string[], hotModels: string[]): string[] {
+  const ordered = [...siteModels].sort(compareModelNewestFirst);
+  const matched: string[] = [];
+
+  for (const hot of hotModels) {
+    const perVariant = new Map<string, string>();
+    for (const site of ordered) {
+      if (!hotModelMatches(hot, site)) continue;
+      const key = modelVariantKey(site);
+      if (perVariant.has(key)) continue;
+      perVariant.set(key, site);
+      if (perVariant.size >= MAX_HOT_VARIANTS) break;
+    }
+    matched.push(...perVariant.values());
+  }
+
+  // 多条热点可能命中同一个模型（qwen3.8 与 qwen-3.8），去重避免重复请求
+  return uniqueStrings(matched);
+}
+// 一条热点在一个站点上最多测几个变体，防止个别站点把一个版本铺成几十个马甲
+const MAX_HOT_VARIANTS = 6;
+// 这些 token 不代表不同模型：免费镜像、别名、思考档位（high / medium / low）
+const MODEL_NOISE_TOKENS = new Set([
+  "free",
+  "latest",
+  "temp",
+  "stable",
+  "online",
+  "beta",
+  "rc",
+  "test",
+  "new",
+  "default",
+  "high",
+  "medium",
+  "low",
+  "minimal",
+  "none"
+]);
+// 变体指纹：丢掉日期快照号、上下文长度标记（1M / 200k）和噪声词之后剩下的部分。
+// 于是 deepseek-v4-flash 与 deepseek-v4-flash-0731 算同一个，
+// 而 qwen3.8-27b 与 qwen3.8-flash、glm-5.2-fast 与 glm-5.2-think 算不同模型
+function modelVariantKey(name: string): string {
+  return normalizeModelKey(name)
+    .split("-")
+    .filter((token) => token && !/^\d{3,}$/.test(token) && !/^\d+[km]$/i.test(token) && !MODEL_NOISE_TOKENS.has(token))
+    .join("-");
+}
+// 开了热点模型时，模型列表超过这个时长就先刷一次：站点新上的模型不在旧列表里，
+// 是「热点选了却测不到」的另一大来源。/models 不消耗 token，宁可多刷
+const HOT_MODEL_PROBE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+function modelVersionNumbers(name: string): number[] {
+  return (name.match(/\d+(?:\.\d+)?/g) || []).map((value) => Number(value)).filter((value) => Number.isFinite(value));
+}
+// 版本号大的排前面，让「最新模型」自然浮到每个分类顶部
+function compareModelNewestFirst(a: string, b: string): number {
+  const na = modelVersionNumbers(a);
+  const nb = modelVersionNumbers(b);
+  const length = Math.max(na.length, nb.length);
+  for (let index = 0; index < length; index += 1) {
+    const diff = (nb[index] ?? -1) - (na[index] ?? -1);
+    if (diff !== 0) return diff;
+  }
+
+  return a.localeCompare(b);
+}
+// 截出「厂家 + 大版本 + 一级小版本」：glm-5.2、deepseek-v4、gpt-5.1、claude-sonnet-4-5 保留，
+// flash / pro / mini 这类变体词和日期快照继续丢掉。
+// 做法是在归一化名里找到版本号就截断，保证结果永远是原名的前缀，
+// 所以 glm-5.2 天然能命中站点上的 glm-5.2-0731，不会出现收完反而匹配不上。
+function majorModelName(raw: string): string {
+  const normalized = normalizeModelKey(raw);
+  if (!normalized) return "";
+
+  // 小版本有两种写法：点号（5.2 / 4.20）和 Anthropic 的连字符（sonnet-4-5）。
+  // 末尾的 (?![a-z0-9]) 是防止把 -0309、-32k、-8b 这类日期/规格尾巴误当成小版本
+  const version = /([a-z]{0,2}\d{1,2}(?:\.\d{1,2})?(?:-\d{1,2}(?![a-z0-9]))?)/.exec(normalized);
+  if (!version || version.index === undefined) return normalized;
+
+  return `${normalized.slice(0, version.index)}${version[1]}`;
 }
 const MODEL_TAG_RULES: { tag: string; patterns: RegExp[] }[] = [
   { tag: "image", patterns: [/\bimage\b/i, /\bvision\b/i, /\bvl\b/i, /\bflux\b/i, /\bsd(?:xl)?\b/i, /stable[- ]?diffusion/i] },
@@ -319,14 +507,14 @@ function normalizeBaseUrl(raw: string): string {
 const BATCH_TASK_CONCURRENCY = 2;
 const BATCH_TASK_STAGGER_MS = 1500;
 
-async function runBatchWithConcurrency(
+async function runBatchWithConcurrency<T>(
   items: KeyConfig[],
-  worker: (item: KeyConfig) => Promise<boolean>
-): Promise<boolean[]> {
+  worker: (item: KeyConfig) => Promise<T>
+): Promise<T[]> {
   const total = items.length;
   if (total === 0) return [];
 
-  const results = new Array<boolean>(total).fill(false);
+  const results: T[] = new Array(total);
   let cursor = 0;
 
   const runLane = async (laneIndex: number) => {
@@ -1020,6 +1208,7 @@ function normalizeFinishedTestResult(input: unknown): FinishedTestResult | undef
   const detail = rawDetail && !legacyResponseText ? cleanOneLineText(rawDetail, 300) : responseText ? "接口连通，已收到模型回复" : "";
   const testedModel = typeof input.model === "string" ? input.model.trim() : "";
   const testedAt = safeDateToIso(input.testedAt);
+  const elapsedMs = toFiniteMs(input.elapsedMs);
 
   if (!testedAt) return undefined;
 
@@ -1030,8 +1219,50 @@ function normalizeFinishedTestResult(input: unknown): FinishedTestResult | undef
     model: testedModel || undefined,
     responseText: responseText || undefined,
     responseSource,
-    testedAt
+    testedAt,
+    elapsedMs: elapsedMs ?? undefined
   };
+}
+
+function toFiniteMs(input: unknown): number | null {
+  if (typeof input !== "number" || !Number.isFinite(input)) return null;
+  return Math.max(0, Math.round(input));
+}
+
+// 循环测试明细：只留成功/失败两类，并截断详情，控制 configs.json 体积
+function normalizeStoredModelTests(input: unknown): FinishedModelTestItem[] | undefined {
+  if (!Array.isArray(input)) return undefined;
+
+  const out: FinishedModelTestItem[] = [];
+  for (const raw of input) {
+    if (!isRecord(raw)) continue;
+
+    const model = typeof raw.model === "string" ? raw.model.trim() : "";
+    const testedAt = safeDateToIso(raw.testedAt);
+    const status = raw.status;
+    if (!model || !testedAt || (status !== "success" && status !== "error")) continue;
+
+    const detail = typeof raw.detail === "string" && raw.detail.trim() ? cleanOneLineText(raw.detail, 300) : "";
+    const elapsedMs = toFiniteMs(raw.elapsedMs);
+    const responseSource =
+      raw.responseSource === "stream" ||
+      raw.responseSource === "chat" ||
+      raw.responseSource === "responses" ||
+      raw.responseSource === "messages"
+        ? raw.responseSource
+        : undefined;
+
+    out.push({
+      model,
+      status,
+      testedAt,
+      detail: detail || undefined,
+      elapsedMs: elapsedMs ?? undefined,
+      responseSource
+    });
+  }
+
+  return out.length > 0 ? out.slice(0, MAX_CYCLE_MODELS) : undefined;
 }
 
 function normalizeFinishedProbeResult(input: unknown): FinishedProbeResult | undefined {
@@ -1522,12 +1753,22 @@ function normalizeStoredConfigItem(input: unknown, index: number): KeyConfig | u
             ? "failed"
             : "success";
   const testMode: KeyConfig["testMode"] = input.testMode === "single" ? "single" : "chain";
-  const hasCoreValue = Boolean(rawName || baseUrl || apiKey || model || probe || lastTest || benchmarks);
+  const modelTests = normalizeStoredModelTests(input.modelTests || input.modelTestResults);
+  const rawCycleInterval =
+    typeof input.cycleIntervalSec === "number"
+      ? input.cycleIntervalSec
+      : typeof input.cycleIntervalSec === "string"
+        ? Number(input.cycleIntervalSec)
+        : NaN;
+  const cycleIntervalSec = Number.isFinite(rawCycleInterval)
+    ? Math.min(CYCLE_INTERVAL_MAX_SEC, Math.max(CYCLE_INTERVAL_MIN_SEC, Math.round(rawCycleInterval)))
+    : undefined;
+  const hasCoreValue = Boolean(rawName || baseUrl || apiKey || model || probe || lastTest || benchmarks || modelTests);
 
   if (!hasCoreValue) return undefined;
 
   const name = rawName || makeDefaultName(index + 1);
-  return { id, name, baseUrl, apiKey, model, apiFormat, listStatus, testMode, createdAt, sourceMeta, probe, lastTest, benchmarks };
+  return { id, name, baseUrl, apiKey, model, apiFormat, listStatus, testMode, cycleIntervalSec, modelTests, createdAt, sourceMeta, probe, lastTest, benchmarks };
 }
 
 function toStoredConfigCandidates(parsed: unknown): unknown[] {
@@ -1613,6 +1854,27 @@ export default function Home() {
   const [resultMap, setResultMap] = useState<Record<string, TestResult>>({});
   const [probeMap, setProbeMap] = useState<Record<string, ProbeResult>>({});
   const [benchmarkMap, setBenchmarkMap] = useState<Record<string, Record<string, ModelBenchmarkResult>>>({});
+  // 循环测试逐模型明细（运行时），弹窗与卡片按钮优先读这里，没有实时值时回落到已保存的 modelTests
+  const [modelTestMap, setModelTestMap] = useState<Record<string, ModelTestItem[]>>({});
+  const [modelTestDialogId, setModelTestDialogId] = useState<string | null>(null);
+  const [modelTestFilter, setModelTestFilter] = useState<ModelTestFilter>("all");
+  const [modelTestSearch, setModelTestSearch] = useState("");
+  const [cycleIntervalInput, setCycleIntervalInput] = useState(String(DEFAULT_CYCLE_INTERVAL_SEC));
+  // 热点模型：已保存的列表与开关（服务端 data/hot-models.json）
+  const [hotModels, setHotModels] = useState<string[]>([]);
+  const [hotModelsEnabled, setHotModelsEnabled] = useState(false);
+  // 弹窗里改的是草稿，点「保存」才落盘，避免误点直接改变测试行为
+  const [hotModelDialogOpen, setHotModelDialogOpen] = useState(false);
+  const [hotModelDraft, setHotModelDraft] = useState<string[]>([]);
+  const [hotModelDraftEnabled, setHotModelDraftEnabled] = useState(false);
+  const [hotModelVendor, setHotModelVendor] = useState<HotVendor | "all">("all");
+  // 展示粒度：默认只给大版本（glm-5），要精确挑某个变体时再切到完整型号
+  const [hotModelGranularity, setHotModelGranularity] = useState<"major" | "full">("major");
+  const [hotModelSearch, setHotModelSearch] = useState("");
+  const [hotModelCustom, setHotModelCustom] = useState("");
+  const [isSavingHotModels, setIsSavingHotModels] = useState(false);
+  const cycleCancelRef = useRef<Record<string, boolean>>({});
+  const cycleStatsRef = useRef<Record<string, { ok: number; total: number }>>({});
   const [notice, setNoticeState] = useState<NoticeState | null>(null);
   const [testingAll, setTestingAll] = useState(false);
   const [probingAll, setProbingAll] = useState(false);
@@ -1713,6 +1975,187 @@ export default function Home() {
     setTheme(normalized);
   }, []);
 
+  // 循环测试间隔：从本地读取全局默认值，非法值回落到 20 秒
+  useEffect(() => {
+    const stored = Number(localStorage.getItem(CYCLE_INTERVAL_STORAGE_KEY));
+    if (Number.isFinite(stored) && stored >= CYCLE_INTERVAL_MIN_SEC && stored <= CYCLE_INTERVAL_MAX_SEC) {
+      setCycleIntervalInput(String(Math.round(stored)));
+    }
+  }, []);
+
+  function getCycleIntervalSec(): number {
+    const numeric = Number(String(cycleIntervalInput).trim());
+    if (!Number.isFinite(numeric) || numeric <= 0) return DEFAULT_CYCLE_INTERVAL_SEC;
+    return Math.min(CYCLE_INTERVAL_MAX_SEC, Math.max(CYCLE_INTERVAL_MIN_SEC, Math.round(numeric)));
+  }
+
+  function updateCycleIntervalSec(raw: string) {
+    setCycleIntervalInput(raw);
+    const numeric = Number(raw.trim());
+    if (!Number.isFinite(numeric) || numeric <= 0) return;
+    try {
+      localStorage.setItem(CYCLE_INTERVAL_STORAGE_KEY, String(Math.round(numeric)));
+    } catch {
+      // 忽略隐身模式等写入失败。
+    }
+  }
+
+  // 热点模型：读失败就静默退回「全量扫描」，不阻塞主流程
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadHotModels() {
+      try {
+        const response = await fetch("/api/hot-models", { cache: "no-store" });
+        if (!response.ok) return;
+
+        const payload: unknown = await response.json();
+        if (cancelled || !isRecord(payload)) return;
+
+        const models = Array.isArray(payload.models)
+          ? payload.models
+              .filter((item): item is string => typeof item === "string")
+              .map((item) => item.trim())
+              .filter(Boolean)
+          : [];
+        setHotModels(uniqueStrings(models).slice(0, MAX_HOT_MODELS));
+        setHotModelsEnabled(payload.enabled === true);
+      } catch {
+        // 忽略：热点模型是增强项，拿不到就按关闭处理
+      }
+    }
+
+    void loadHotModels();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // 候选池 = 各站点已识别到的真实模型（含配置模型、测速过的模型）+ 内置候选，按厂家分组
+  // 默认折叠成大版本：glm-5.2 与 glm-5.3-flash 合成一个 glm-5，顺手剔掉画图/向量类
+  const hotModelGroups = useMemo(() => {
+    const toChips = (models: string[]) => {
+      const collapsed = models
+        .map((model) => model.trim())
+        .filter((model) => model && isLikelyChatBenchmarkable(model))
+        .map((model) => (hotModelGranularity === "major" ? majorModelName(model) : model))
+        .filter(Boolean);
+
+      // 按「去连字符」的写法去重：qwen3.8 与 qwen-3.8 只留一条，
+      // 免得候选里出现两个其实同族的格子，勾选时还容易漏
+      const seenKeys = new Set<string>();
+      const deduped = collapsed.filter((model) => {
+        const key = normalizeModelKey(model).replace(/-/g, "");
+        if (!key || seenKeys.has(key)) return false;
+        seenKeys.add(key);
+        return true;
+      });
+
+      return uniqueStrings(deduped).sort(compareModelNewestFirst);
+    };
+
+    const discovered = toChips(
+      configs.flatMap((item) => [
+        ...(item.probe?.supportedModels || []),
+        ...Object.keys(item.benchmarks || {}),
+        item.model
+      ])
+    );
+
+    const discoveredKeys = new Set(discovered.map(normalizeModelKey));
+    const seed = toChips(HOT_MODEL_SEED).filter((model) => !discoveredKeys.has(normalizeModelKey(model)));
+
+    return HOT_MODEL_VENDOR_ORDER.map((entry) => ({
+      vendor: entry.vendor,
+      label: entry.label,
+      discovered: discovered.filter((model) => inferHotVendor(model) === entry.vendor),
+      seed: seed.filter((model) => inferHotVendor(model) === entry.vendor)
+    })).filter((group) => group.discovered.length > 0 || group.seed.length > 0);
+  }, [configs, hotModelGranularity]);
+
+  const hotModelCatalog = useMemo(
+    () => hotModelGroups.flatMap((group) => [...group.discovered, ...group.seed]),
+    [hotModelGroups]
+  );
+
+  function openHotModelDialog() {
+    setHotModelDraft(hotModels);
+    setHotModelDraftEnabled(hotModelsEnabled);
+    setHotModelVendor("all");
+    setHotModelSearch("");
+    setHotModelCustom("");
+    setHotModelDialogOpen(true);
+  }
+
+  function closeHotModelDialog() {
+    setHotModelDialogOpen(false);
+  }
+
+  function toggleHotModelDraft(model: string) {
+    setHotModelDraft((prev) => {
+      if (prev.includes(model)) return prev.filter((item) => item !== model);
+      if (prev.length >= MAX_HOT_MODELS) return prev;
+      return [...prev, model];
+    });
+  }
+
+  function toggleHotModelGroup(models: string[], select: boolean) {
+    setHotModelDraft((prev) => {
+      if (select) {
+        const merged = new Set(prev);
+        for (const model of models) {
+          if (merged.size >= MAX_HOT_MODELS) break;
+          merged.add(model);
+        }
+        return Array.from(merged);
+      }
+
+      const removing = new Set(models);
+      return prev.filter((model) => !removing.has(model));
+    });
+  }
+
+  function addHotModelDraft() {
+    const model = hotModelCustom.trim();
+    setHotModelCustom("");
+    if (!model) return;
+    if (hotModelDraft.includes(model)) return;
+    if (hotModelDraft.length >= MAX_HOT_MODELS) {
+      setNotice(`热点模型最多 ${MAX_HOT_MODELS} 个`, "error");
+      return;
+    }
+
+    setHotModelDraft((prev) => [...prev, model]);
+  }
+
+  async function saveHotModels() {
+    const models = uniqueStrings(hotModelDraft.map((model) => model.trim()).filter(Boolean)).slice(0, MAX_HOT_MODELS);
+    setIsSavingHotModels(true);
+    try {
+      const response = await fetch("/api/hot-models", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ version: 1, enabled: hotModelDraftEnabled, models })
+      });
+      if (!response.ok) throw new Error("save failed");
+
+      setHotModels(models);
+      setHotModelsEnabled(hotModelDraftEnabled);
+      setHotModelDialogOpen(false);
+      setNotice(
+        hotModelDraftEnabled && models.length > 0
+          ? `已保存热点模型 ${models.length} 个，循环测试只测这些模型`
+          : hotModelDraftEnabled
+            ? "已保存：开关已开但没选模型，循环测试仍会全量扫描"
+            : "已保存：循环测试保持全量扫描"
+      );
+    } catch {
+      setNotice("保存热点模型失败，请检查服务状态", "error");
+    } finally {
+      setIsSavingHotModels(false);
+    }
+  }
+
   // 搜索下拉：点击外部或按 Esc 关闭候选列表。
   useEffect(() => {
     if (!searchDropdownOpen) return;
@@ -1788,7 +2231,9 @@ export default function Home() {
     return item.lastTest?.status === "error" ? "failed" : "success";
   }
   function getConfigTestMode(item: KeyConfig): "chain" | "single" {
-    return item.testMode === "single" ? "single" : "chain";
+    if (item.testMode) return item.testMode;
+    // 未单独设置时按所在列表的默认约定：成功列表仅测选中，失败列表循环测试
+    return getConfigListStatus(item) === "failed" ? "chain" : "single";
   }
   function setConfigTestMode(id: string, mode: "chain" | "single") {
     setConfigs((prev) => prev.map((item) => (item.id === id ? { ...item, testMode: mode } : item)));
@@ -1796,8 +2241,15 @@ export default function Home() {
     setNotice(
       mode === "single"
         ? `已切换为仅测选中：${target?.name || ""} 只测试配置/推荐的模型`
-        : `已切换为循环测试：${target?.name || ""} 失败时沿站点模型列表自动匹配`
+        : `已切换为循环测试：${target?.name || ""} 将按 ${getCycleIntervalSec()} 秒一个模型扫完整份模型列表`
     );
+  }
+  // 卡片实际使用的循环间隔：优先卡片自己的设置，其次全局默认
+  function getConfigCycleIntervalSec(item: KeyConfig): number {
+    return item.cycleIntervalSec ?? getCycleIntervalSec();
+  }
+  function setConfigCycleIntervalSec(id: string, seconds?: number) {
+    setConfigs((prev) => prev.map((item) => (item.id === id ? { ...item, cycleIntervalSec: seconds } : item)));
   }
   const sortedConfigs = [...configs].sort(compareConfigsByTestedAtDesc);
   const failedConfigs = sortedConfigs.filter((item) => getConfigListStatus(item) === "failed");
@@ -1884,12 +2336,14 @@ export default function Home() {
     setCollapsedIds((prev) => ({ ...prev, ...Object.fromEntries(activeConfigs.map((item) => [item.id, false])) }));
   }
 
-  // 全局一键切换测试方式：只要还有卡片是循环测试，点击即全部设为仅测选中；反之全部恢复循环测试
-  function toggleAllTestModes() {
-    const allSingle = configs.every((item) => getConfigTestMode(item) === "single");
+  // 全局一键切换测试方式：只作用于当前激活的列表（成功/失败列表互不影响）
+  // 只要当前列表还有卡片是循环测试，点击即整表设为仅测选中；反之整表恢复循环测试
+  function toggleActiveAllTestModes() {
+    const allSingle = activeConfigs.length > 0 && activeConfigs.every((item) => getConfigTestMode(item) === "single");
     const nextMode: "chain" | "single" = allSingle ? "chain" : "single";
-    setConfigs((prev) => prev.map((item) => ({ ...item, testMode: nextMode })));
-    setNotice(nextMode === "single" ? "已将全部卡片设为仅测选中" : "已将全部卡片设为循环测试");
+    const targetIds = new Set(activeConfigs.map((item) => item.id));
+    setConfigs((prev) => prev.map((item) => (targetIds.has(item.id) ? { ...item, testMode: nextMode } : item)));
+    setNotice(`已将当前列表 ${targetIds.size} 张卡片设为${nextMode === "single" ? "仅测选中" : "循环测试"}`);
   }
 
   // 共享卡片渲染：成功 / 失败 / 禁用列表共用同一函数，折叠/小框设计一致复用
@@ -1907,6 +2361,10 @@ export default function Home() {
     const isCollapsed = !isEditing && isConfigCollapsed(item.id);
     const probing = probe.status === "pending";
     const isDisabled = getConfigListStatus(item) === "disabled";
+    // 循环测试明细：优先运行时结果，其次已保存的明细
+    const modelTestEntries = modelTestMap[item.id] || item.modelTests || [];
+    const modelTestOkCount = modelTestEntries.filter((entry) => entry.status === "success").length;
+    const cycleRunning = Boolean(testing) && getConfigTestMode(item) === "chain";
     const currentModelTags = inferModelTags(item.model);
     const runtimeBenchmarks = benchmarkMap[item.id] || {};
     const currentBenchmark =
@@ -1987,9 +2445,9 @@ export default function Home() {
           </div>
         ) : (
           <>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5">
               <div
-                className="group/card flex min-w-0 flex-1 items-center gap-2 rounded-lg px-1.5 py-1 -mx-1.5 -my-1 cursor-pointer outline-none transition hover:bg-zinc-50/70 focus-visible:ring-2 focus-visible:ring-emerald-300 dark:hover:bg-zinc-800/40"
+                className="group/card flex min-w-0 flex-1 basis-56 items-center gap-2 rounded-lg px-1.5 py-1 -mx-1.5 -my-1 cursor-pointer outline-none transition hover:bg-zinc-50/70 focus-visible:ring-2 focus-visible:ring-emerald-300 dark:hover:bg-zinc-800/40"
               onClick={() => toggleCollapse(item.id)}
               role="button"
               tabIndex={0}
@@ -2008,7 +2466,7 @@ export default function Home() {
                   <FaChevronDown aria-hidden />
                 </span>
               </span>
-              <div className="min-w-0 max-w-[min(48vw,28rem)] truncate text-base font-bold text-zinc-900 dark:text-zinc-100">{item.name}</div>
+              <div className="min-w-0 max-w-[min(48vw,32rem)] truncate text-base font-bold text-zinc-900 dark:text-zinc-100">{item.name}</div>
               <span
                 className={`inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-xs ${statusPillClass(result.status)}`}
                 title={result.message}
@@ -2018,7 +2476,41 @@ export default function Home() {
               </span>
               </div>
               {isCollapsed ? (
-                <div className="ml-auto flex shrink-0 items-center gap-1.5">
+                <>
+                  <button
+                    type="button"
+                    className={`${smallBtn} ${
+                      cycleRunning
+                        ? "border-emerald-300 text-emerald-700 dark:border-emerald-700 dark:text-emerald-400"
+                        : ""
+                    }`}
+                    onClick={() => openModelTestDialog(item)}
+                    disabled={modelTestEntries.length === 0}
+                    title={
+                      modelTestEntries.length === 0
+                        ? "暂无循环测试明细，先把测试方式切到循环测试跑一轮"
+                        : `查看 ${modelTestEntries.length} 个模型的测试结果（成功 ${modelTestOkCount} 个）`
+                    }
+                    aria-label="测试列表"
+                  >
+                    <FaListAlt aria-hidden />
+                    <span>
+                      测试列表{modelTestEntries.length > 0 ? ` ${modelTestOkCount}/${modelTestEntries.length}` : ""}
+                    </span>
+                  </button>
+                  {cycleRunning ? (
+                    <button
+                      type="button"
+                      className={`${smallBtn} border-red-200 text-red-600 dark:border-red-900/60 dark:text-red-400`}
+                      onClick={() => stopCycleTest(item.id)}
+                      title="停止循环测试（当前模型测完即停）"
+                      aria-label="停止循环测试"
+                    >
+                      <FaStopCircle aria-hidden />
+                      <span>停止</span>
+                    </button>
+                  ) : null}
+                <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-1.5">
                   {isDisabled ? (
                     <button
                       type="button"
@@ -2107,6 +2599,7 @@ export default function Home() {
                     <span>删除</span>
                   </button>
                 </div>
+                </>
               ) : null}
             </div>
 
@@ -2265,14 +2758,41 @@ export default function Home() {
                     <span className="inline-flex items-center gap-1 text-xs text-zinc-500">
                       <FaExchangeAlt aria-hidden /> 测试方式
                     </span>
-                    <select
-                      className={`${inputClass} max-w-md`}
-                      value={getConfigTestMode(item)}
-                      onChange={(e) => setConfigTestMode(item.id, e.target.value === "single" ? "single" : "chain")}
-                    >
-                      <option value="chain">循环测试 — 失败时沿站点模型列表自动匹配可用模型</option>
-                      <option value="single">仅测选中 — 只测试配置/推荐的模型</option>
-                    </select>
+                    <div className="grid gap-1.5">
+                      <select
+                        className={`${inputClass} max-w-md`}
+                        value={getConfigTestMode(item)}
+                        onChange={(e) => setConfigTestMode(item.id, e.target.value === "single" ? "single" : "chain")}
+                      >
+                        <option value="chain">循环测试 — 按频率把整份模型列表逐个测一遍</option>
+                        <option value="single">仅测选中 — 只测试配置/推荐的模型</option>
+                      </select>
+                      <label className="flex flex-wrap items-center gap-2 text-xs text-zinc-500">
+                        <span>循环间隔（秒/模型）</span>
+                        <input
+                          type="number"
+                          min={CYCLE_INTERVAL_MIN_SEC}
+                          max={CYCLE_INTERVAL_MAX_SEC}
+                          className="w-20 rounded-lg border border-zinc-300 bg-white px-2 py-1 text-sm text-zinc-900 outline-none focus:border-emerald-400 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
+                          value={item.cycleIntervalSec ?? ""}
+                          placeholder={String(getCycleIntervalSec())}
+                          onChange={(e) => {
+                            const raw = e.target.value.trim();
+                            if (!raw) {
+                              setConfigCycleIntervalSec(item.id, undefined);
+                              return;
+                            }
+                            const numeric = Number(raw);
+                            if (!Number.isFinite(numeric) || numeric <= 0) return;
+                            setConfigCycleIntervalSec(
+                              item.id,
+                              Math.min(CYCLE_INTERVAL_MAX_SEC, Math.max(CYCLE_INTERVAL_MIN_SEC, Math.round(numeric)))
+                            );
+                          }}
+                        />
+                        <span>留空跟随全局默认 {getCycleIntervalSec()} 秒</span>
+                      </label>
+                    </div>
                   </div>
 
                   <div className="grid gap-1 sm:grid-cols-[90px_1fr] sm:items-start sm:gap-2">
@@ -2294,6 +2814,41 @@ export default function Home() {
                           </span>
                         ) : null}
                       </span>
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <button
+                          type="button"
+                          className={`${smallBtn} ${
+                            cycleRunning
+                              ? "border-emerald-300 text-emerald-700 dark:border-emerald-700 dark:text-emerald-400"
+                              : ""
+                          }`}
+                          onClick={() => openModelTestDialog(item)}
+                          disabled={modelTestEntries.length === 0}
+                          title={
+                            modelTestEntries.length === 0
+                              ? "暂无循环测试明细，先把测试方式切到循环测试跑一轮"
+                              : `查看 ${modelTestEntries.length} 个模型的测试结果（成功 ${modelTestOkCount} 个）`
+                          }
+                          aria-label="测试列表"
+                        >
+                          <FaListAlt aria-hidden />
+                          <span>
+                            测试列表{modelTestEntries.length > 0 ? `（${modelTestOkCount}/${modelTestEntries.length}）` : ""}
+                          </span>
+                        </button>
+                        {cycleRunning ? (
+                          <button
+                            type="button"
+                            className={`${smallBtn} border-red-200 text-red-600 dark:border-red-900/60 dark:text-red-400`}
+                            onClick={() => stopCycleTest(item.id)}
+                            title="停止循环测试（当前模型测完即停）"
+                            aria-label="停止循环测试"
+                          >
+                            <FaStopCircle aria-hidden />
+                            <span>停止</span>
+                          </button>
+                        ) : null}
+                      </div>
                       {result.status === "error" && result.detail ? (
                         <details className="w-full rounded-lg border border-red-100 bg-red-50/50 px-2 py-1.5 text-xs text-red-800">
                           <summary className="cursor-pointer font-medium text-red-700">有错误，点击查看详情</summary>
@@ -2536,6 +3091,10 @@ export default function Home() {
     [configs, ccSwitchDialogId]
   );
   const probeDialogItem = useMemo(() => configs.find((item) => item.id === probeDialogId) || null, [configs, probeDialogId]);
+  const modelTestDialogItem = useMemo(
+    () => configs.find((item) => item.id === modelTestDialogId) || null,
+    [configs, modelTestDialogId]
+  );
   const benchmarkDialogItem = useMemo(
     () => configs.find((item) => item.id === benchmarkDialogId) || null,
     [benchmarkDialogId, configs]
@@ -2860,7 +3419,9 @@ export default function Home() {
   }, [activeBenchmarkSummary, benchmarkChartModel, benchmarkDialogItem, chartReadyBenchmarkResults]);
 
   useEffect(() => {
-    const hasOverlayOpen = Boolean(benchmarkDialogItem || probeDialogItem || ccSwitchDialogItem);
+    const hasOverlayOpen = Boolean(
+      benchmarkDialogItem || probeDialogItem || ccSwitchDialogItem || modelTestDialogItem
+    );
     if (!hasOverlayOpen) return;
 
     const body = document.body;
@@ -2881,7 +3442,7 @@ export default function Home() {
       body.style.paddingRight = previousBodyPaddingRight;
       html.style.overflow = previousHtmlOverflow;
     };
-  }, [benchmarkDialogItem, ccSwitchDialogItem, probeDialogItem]);
+  }, [benchmarkDialogItem, ccSwitchDialogItem, probeDialogItem, modelTestDialogItem]);
 
   function ExportMenu({
     onExport,
@@ -3151,6 +3712,15 @@ export default function Home() {
     if (benchmarkDialogId === id) {
       setBenchmarkDialogId(null);
     }
+    if (modelTestDialogId === id) {
+      setModelTestDialogId(null);
+    }
+    cycleCancelRef.current[id] = true;
+    setModelTestMap((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
     setNotice("已删除");
   }
 
@@ -3175,6 +3745,11 @@ export default function Home() {
     setCcSwitchDialogId(null);
     setProbeDialogId(null);
     setBenchmarkDialogId(null);
+    setModelTestDialogId(null);
+    setModelTestMap({});
+    Object.keys(cycleCancelRef.current).forEach((key) => {
+      cycleCancelRef.current[key] = true;
+    });
     setNotice("已删除全部配置");
   }
 
@@ -3187,10 +3762,17 @@ export default function Home() {
         if (item.listStatus === "disabled") {
           return { ...item, lastTest: result };
         }
+        const nextListStatus = result.status === "error" ? "failed" : "success";
+        const prevListStatus = getConfigListStatus(item);
+        // 卡片跨列表迁移时，测试方式切换为接收列表的默认约定（成功=仅测选中，失败=循环测试），
+        // 避免失败列表批量设置的循环模式跟着卡片混进成功列表；同列表内重测保留已选方式
+        const testMode =
+          prevListStatus === nextListStatus ? item.testMode : nextListStatus === "success" ? "single" : "chain";
         return {
           ...item,
           lastTest: result,
-          listStatus: result.status === "error" ? "failed" : "success"
+          listStatus: nextListStatus,
+          testMode
         };
       })
     );
@@ -3210,8 +3792,10 @@ export default function Home() {
 
   function enableConfig(id: string) {
     const target = configs.find((item) => item.id === id);
-    // 启用后固定进入成功列表，保持折叠
-    setConfigs((prev) => prev.map((item) => (item.id === id ? { ...item, listStatus: "success" } : item)));
+    // 启用后固定进入成功列表，按成功列表默认约定使用仅测选中，保持折叠
+    setConfigs((prev) =>
+      prev.map((item) => (item.id === id ? { ...item, listStatus: "success", testMode: "single" } : item))
+    );
     setActiveList("all");
     ensureCollapsed(id);
     setHighlightedConfigId(id);
@@ -3323,14 +3907,35 @@ export default function Home() {
     }
 
     try {
-      // 循环测试：把探测到的模型列表传给服务端做候选链；仅测选中：不传候选链，只测配置/推荐的模型
+      // 循环测试：整份模型列表按频率逐个测一遍；仅测选中：只测配置/推荐的模型
       const chainMode = getConfigTestMode(item) === "chain";
-      const fallbackModels = chainMode
-        ? (item.probe?.supportedModels || [])
-            .map((model) => model.trim())
-            .filter((model) => model && isLikelyChatBenchmarkable(model))
-            .slice(0, 12)
-        : [];
+      if (chainMode) {
+        let cycleModels = collectCycleModels(item);
+        // 列表为空、或者开了热点模型但列表已经过期时，先刷一次模型识别。
+        // 站点新上的模型不在旧列表里，是「热点明明选了却测不到」的另一大来源；
+        // /models 只花一次请求、不消耗 token，所以这里宁可多刷一次
+        const probeAgeMs = item.probe?.testedAt
+          ? Date.now() - Date.parse(item.probe.testedAt)
+          : Number.POSITIVE_INFINITY;
+        const needReprobe =
+          !cycleCancelRef.current[item.id] &&
+          ((item.probe?.supportedModels?.length ?? 0) === 0 ||
+            (hotFilterActive() && !(probeAgeMs <= HOT_MODEL_PROBE_MAX_AGE_MS)));
+        if (needReprobe) {
+          setResultMap((prev) => ({
+            ...prev,
+            [item.id]: { status: "pending", message: "循环测试前先刷新模型列表..." }
+          }));
+          const probedModels = await runModelProbe(item);
+          if (probedModels.length > 0) {
+            cycleModels = collectCycleModels(item, probedModels);
+          }
+        }
+        if (cycleModels.length > 0) {
+          return await runCycleTest(item, cycleModels, baseUrl, apiKey);
+        }
+      }
+
       const response = await postJsonWithTimeout<OpenAIProxyTestResponse>(
         "/api/openai/test",
         {
@@ -3340,7 +3945,7 @@ export default function Home() {
           // 避免写死 gpt-4o-mini 而渠道分组实际不提供导致误判失败
           model: item.model.trim() || item.probe?.recommendedModel?.trim() || "",
           apiFormat: item.apiFormat || "auto",
-          fallbackModels
+          fallbackModels: []
         },
         // 服务端含瞬时重试和候选链，预算放宽到 8 分钟
         480000
@@ -3367,10 +3972,194 @@ export default function Home() {
       return;
     }
     const ok = await runTest(item);
+    const stats = cycleStatsRef.current[item.id];
+    if (getConfigTestMode(item) === "chain" && stats && stats.total > 0) {
+      setNotice(`循环测试完成：通过 ${stats.ok}/${stats.total} 个模型，点卡片「测试列表」看明细`);
+      return;
+    }
     setNotice(ok ? `${item.name} 测试通过` : `${item.name} 测试失败`);
   }
 
-  async function runModelProbe(item: KeyConfig): Promise<boolean> {
+  // 循环测试要扫描的模型：配置/推荐模型排最前，其余按识别到的顺序，跳过画图、向量等非对话模型
+  // probedOverride 用于「本轮刚识别完」的情况：此时 item 仍是识别前的快照，不能再读 item.probe
+  function collectCycleModels(item: KeyConfig, probedOverride?: string[]): string[] {
+    const configured = item.model.trim() || item.probe?.recommendedModel?.trim() || "";
+    const source = probedOverride ?? item.probe?.supportedModels ?? [];
+    const probed = source
+      .map((model) => model.trim())
+      .filter((model) => model && isLikelyChatBenchmarkable(model));
+
+    // 开了热点模型就只测命中的那几个；这个站点一个都没命中时退化成只测配置模型，
+    // 而不是扫全表——那正是用户要避免的白烧 token
+    if (hotModelsEnabled && hotModels.length > 0) {
+      const hotMatched = pickHotMatchedModels(probed, hotModels);
+      if (hotMatched.length > 0) return hotMatched.slice(0, MAX_CYCLE_MODELS);
+      return configured ? [configured] : [];
+    }
+
+    return uniqueStrings([configured, ...probed]).slice(0, MAX_CYCLE_MODELS);
+  }
+
+  function hotFilterActive(): boolean {
+    return hotModelsEnabled && hotModels.length > 0;
+  }
+
+  function setModelTestItems(id: string, items: ModelTestItem[]) {
+    setModelTestMap((prev) => ({ ...prev, [id]: items }));
+  }
+
+  function patchModelTestItem(id: string, model: string, patch: Partial<ModelTestItem>) {
+    setModelTestMap((prev) => {
+      const list = prev[id] || [];
+      const index = list.findIndex((entry) => entry.model === model);
+      if (index < 0) return { ...prev, [id]: [{ model, status: "idle" as TestStatus, ...patch }] };
+
+      const next = [...list];
+      next[index] = { ...next[index], ...patch };
+      return { ...prev, [id]: next };
+    });
+  }
+
+  // 可中断等待：点了停止就不必再干等满一个间隔
+  async function waitCycleInterval(id: string, ms: number) {
+    const stepMs = 500;
+    let waited = 0;
+    while (waited < ms && !cycleCancelRef.current[id]) {
+      const slice = Math.min(stepMs, ms - waited);
+      await new Promise((resolve) => window.setTimeout(resolve, slice));
+      waited += slice;
+    }
+  }
+
+  // 明细落库：只保留已出结果的条目，刷新后仍能在「测试列表」里看到
+  function commitModelTests(id: string, items: ModelTestItem[]) {
+    const finished = items.filter(
+      (entry): entry is FinishedModelTestItem =>
+        (entry.status === "success" || entry.status === "error") && Boolean(entry.testedAt)
+    );
+    if (finished.length === 0) return;
+
+    setConfigs((prev) =>
+      prev.map((entry) =>
+        entry.id === id ? { ...entry, modelTests: finished.slice(0, MAX_CYCLE_MODELS) } : entry
+      )
+    );
+  }
+
+  // 循环测试主体：同一供应商内按间隔逐个模型测，避免撞站点 RPM 限制
+  async function runCycleTest(
+    item: KeyConfig,
+    models: string[],
+    baseUrl: string,
+    apiKey: string
+  ): Promise<boolean> {
+    const intervalMs = getConfigCycleIntervalSec(item) * 1000;
+    const roundStartedAt = Date.now();
+    delete cycleCancelRef.current[item.id];
+    setModelTestItems(
+      item.id,
+      models.map((model) => ({ model, status: "pending" as TestStatus }))
+    );
+
+    const results: ModelTestItem[] = [];
+
+    for (let index = 0; index < models.length; index += 1) {
+      if (cycleCancelRef.current[item.id]) break;
+
+      const model = models[index];
+      const modelStartedAt = Date.now();
+      setResultMap((prev) => ({
+        ...prev,
+        [item.id]: { status: "pending", message: `循环测试中 ${index + 1}/${models.length}` }
+      }));
+      patchModelTestItem(item.id, model, { status: "pending", detail: `正在测试（${index + 1}/${models.length}）` });
+
+      let entry: ModelTestItem;
+      try {
+        const response = await postJsonWithTimeout<OpenAIProxyTestResponse>(
+          "/api/openai/test",
+          {
+            baseUrl,
+            apiKey,
+            model,
+            apiFormat: item.apiFormat || "auto",
+            // 扫描模式：服务端只测这一个模型，不走候选链也不做整体重试
+            fallbackModels: [],
+            sweep: true
+          },
+          CYCLE_MODEL_REQUEST_TIMEOUT_MS
+        );
+        entry = {
+          model,
+          status: response.result.status,
+          detail: response.result.detail || (response.ok ? "接口连通" : "未返回可读内容"),
+          elapsedMs: response.result.elapsedMs ?? Date.now() - modelStartedAt,
+          responseSource: response.result.responseSource,
+          testedAt: response.result.testedAt || new Date().toISOString()
+        };
+      } catch (error: unknown) {
+        entry = {
+          model,
+          status: "error",
+          detail: makeErrorDetail(error),
+          elapsedMs: Date.now() - modelStartedAt,
+          testedAt: new Date().toISOString()
+        };
+      }
+
+      results.push(entry);
+      patchModelTestItem(item.id, model, entry);
+
+      if (index + 1 < models.length && !cycleCancelRef.current[item.id]) {
+        // 间隔按请求发起时间对齐：慢模型已经吃掉的时间不再重复等待
+        await waitCycleInterval(item.id, Math.max(0, intervalMs - (Date.now() - modelStartedAt)));
+      }
+    }
+
+    const stoppedEarly = Boolean(cycleCancelRef.current[item.id]) && results.length < models.length;
+    const okEntries = results.filter((entry) => entry.status === "success");
+    // 本轮一个都没命中的热点条目：不写出来就是静默漏测，用户只能靠猜
+    const hotUnmatched = hotFilterActive()
+      ? hotModels.filter((hot) => !models.some((model) => hotModelMatches(hot, model)))
+      : [];
+    // 用「本轮没测到」而不是「本站点没有」：这里比对的是本轮实际候选，
+    // 站点有但被变体上限挤掉的条目也算没测到，说「站点没有」会误导
+    const hotMissNote = hotUnmatched.length > 0 ? `，${hotUnmatched.length} 个热点本轮没测到` : "";
+    commitModelTests(item.id, results);
+    cycleStatsRef.current[item.id] = { ok: okEntries.length, total: results.length };
+
+    if (results.length === 0) {
+      setResultMap((prev) => ({ ...prev, [item.id]: item.lastTest || defaultTestResult() }));
+      return false;
+    }
+
+    if (okEntries.length > 0) {
+      commitFinishedTestResult(item.id, {
+        status: "success",
+        message: PASS_TEXT,
+        detail: `循环测试通过 ${okEntries.length}/${results.length} 个模型${
+          stoppedEarly ? "（已提前停止）" : ""
+        }${hotFilterActive() ? `（按热点模型${hotMissNote}）` : ""}，整轮耗时 ${formatDurationLabel(Date.now() - roundStartedAt)}`,
+        model: okEntries[0].model,
+        responseSource: okEntries[0].responseSource,
+        testedAt: okEntries[0].testedAt || new Date().toISOString()
+      });
+      return true;
+    }
+
+    commitFinishedTestResult(item.id, {
+      status: "error",
+      message: FAIL_TEXT,
+      detail: `循环测试 ${results.length} 个模型全部失败${stoppedEarly ? "（已提前停止）" : ""}${
+        hotFilterActive() ? `（按热点模型${hotMissNote}）` : ""
+      }：${results[0].detail || "未返回可读内容"}`,
+      testedAt: results[results.length - 1].testedAt || new Date().toISOString()
+    });
+    return false;
+  }
+
+  // 返回本轮识别到的模型名列表（失败时为空数组），供循环测试直接拿去扫描
+  async function runModelProbe(item: KeyConfig): Promise<string[]> {
     setProbeMap((prev) => ({
       ...prev,
       [item.id]: {
@@ -3389,7 +4178,7 @@ export default function Home() {
         detail: "地址或 Key 为空，无法探测模型",
         testedAt: new Date().toISOString()
       });
-      return false;
+      return [];
     }
 
     try {
@@ -3403,7 +4192,7 @@ export default function Home() {
         20000
       );
       commitFinishedProbeResult(item.id, response.result);
-      return response.ok;
+      return response.result.supportedModels || [];
     } catch (error: unknown) {
       commitFinishedProbeResult(item.id, {
         status: "error",
@@ -3411,7 +4200,7 @@ export default function Home() {
         detail: makeErrorDetail(error),
         testedAt: new Date().toISOString()
       });
-      return false;
+      return [];
     }
   }
 
@@ -3637,9 +4426,9 @@ export default function Home() {
   }
 
   async function probeConfig(item: KeyConfig) {
-    const ok = await runModelProbe(item);
+    const models = await runModelProbe(item);
     setProbeDialogId(item.id);
-    setNotice(ok ? `${item.name} 模型探测完成` : `${item.name} 模型探测失败`);
+    setNotice(models.length > 0 ? `${item.name} 模型探测完成` : `${item.name} 模型探测失败`);
   }
 
   async function probeAllConfigs() {
@@ -3657,7 +4446,7 @@ export default function Home() {
     setNotice(`开始探测当前${activeList === "failed" ? "失败" : "成功"}列表模型...`);
     // 低并发+错峰执行，避免并发齐射触发上游 RPM 限流
     const result = await runBatchWithConcurrency(targetConfigs, runModelProbe);
-    const okCount = result.filter(Boolean).length;
+    const okCount = result.filter((models) => models.length > 0).length;
     setProbingAll(false);
     setNotice(`探测完成：成功 ${okCount}，失败 ${result.length - okCount}`);
   }
@@ -3800,6 +4589,22 @@ export default function Home() {
     setBenchmarkDialogId(null);
     setBenchmarkBatch(null);
     setProbeDialogId(item.id);
+  }
+
+  function openModelTestDialog(item: KeyConfig) {
+    setModelTestSearch("");
+    setModelTestFilter("all");
+    setModelTestDialogId(item.id);
+  }
+
+  function closeModelTestDialog() {
+    setModelTestDialogId(null);
+  }
+
+  function stopCycleTest(id: string) {
+    cycleCancelRef.current[id] = true;
+    const target = configs.find((item) => item.id === id);
+    setNotice(`已请求停止循环测试：${target?.name || ""}（当前模型测完即停）`);
   }
 
   function openBenchmarkDialog(item: KeyConfig) {
@@ -4038,7 +4843,7 @@ export default function Home() {
   }
 
   return (
-    <main className="mx-auto w-full max-w-7xl space-y-3 px-3 py-4 text-zinc-900 sm:px-5 lg:px-6 dark:text-zinc-100">
+    <main className="mx-auto w-full max-w-[1600px] space-y-3 px-3 py-4 text-zinc-900 sm:px-5 lg:px-6 dark:text-zinc-100">
       <header className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
         <div>
           <h1 className="flex items-center gap-2.5 text-2xl font-bold tracking-tight text-zinc-900 sm:text-3xl dark:text-zinc-50">
@@ -4087,7 +4892,8 @@ export default function Home() {
         </div>
       </header>
 
-      <div className="grid gap-3 lg:grid-cols-[minmax(22rem,26rem)_minmax(0,1fr)] xl:grid-cols-[minmax(24rem,28rem)_minmax(0,1fr)]">
+      {/* 左栏表单宽度封顶，页面加宽的增量全部让给右侧配置列表 */}
+      <div className="mx-auto grid w-full gap-3 lg:grid-cols-[minmax(22rem,26rem)_minmax(0,1fr)] xl:grid-cols-[minmax(24rem,28rem)_minmax(0,1fr)]">
         <section className="rounded-2xl border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900 p-3.5 shadow-sm sm:p-5">
           <div className="mb-3 flex items-center justify-between gap-3">
             <h2 className="text-base font-semibold text-zinc-900">新增配置</h2>
@@ -4294,26 +5100,67 @@ export default function Home() {
                 <FaExpandArrowsAlt aria-hidden />
                 <span>打开全部</span>
               </button>
+              {activeList !== "disabled"
+                ? (() => {
+                    const allSingle =
+                      activeConfigs.length > 0 && activeConfigs.every((item) => getConfigTestMode(item) === "single");
+                    return (
+                      <button
+                        type="button"
+                        className={`${topBtnGhost} ${
+                          activeConfigs.length === 0 || allSingle
+                            ? ""
+                            : "border-amber-300 text-amber-700 dark:border-amber-700 dark:text-amber-400"
+                        }`}
+                        onClick={toggleActiveAllTestModes}
+                        disabled={activeConfigs.length === 0}
+                        title={
+                          allSingle
+                            ? "当前列表全部为仅测选中，点击一键恢复循环测试（只影响当前列表）"
+                            : "点击把当前列表所有卡片设为仅测选中（只影响当前列表，不改其他列表）"
+                        }
+                      >
+                        <FaExchangeAlt aria-hidden />
+                        <span>{allSingle ? "全部循环" : "全部单测"}</span>
+                      </button>
+                    );
+                  })()
+                : null}
+
+              <label
+                className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-full border border-zinc-300 bg-white px-3 py-1.5 text-sm font-medium text-zinc-700 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
+                title="循环测试在同一供应商内两次模型测试之间的最小间隔，站点有 RPM 限制时可调大"
+              >
+                <FaExchangeAlt className="text-zinc-400" aria-hidden />
+                <span>循环间隔</span>
+                <input
+                  type="number"
+                  min={CYCLE_INTERVAL_MIN_SEC}
+                  max={CYCLE_INTERVAL_MAX_SEC}
+                  className="w-14 rounded-md border border-zinc-300 bg-white px-1.5 py-0.5 text-center text-sm text-zinc-900 outline-none focus:border-emerald-400 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
+                  value={cycleIntervalInput}
+                  onChange={(e) => updateCycleIntervalSec(e.target.value)}
+                />
+                <span>秒</span>
+              </label>
+
               {(() => {
-                const allSingle = configs.length > 0 && configs.every((item) => getConfigTestMode(item) === "single");
+                const hotOn = hotModelsEnabled && hotModels.length > 0;
                 return (
                   <button
                     type="button"
                     className={`${topBtnGhost} ${
-                      configs.length === 0 || allSingle
-                        ? ""
-                        : "border-amber-300 text-amber-700 dark:border-amber-700 dark:text-amber-400"
+                      hotOn ? "border-emerald-400 text-emerald-700 dark:border-emerald-600 dark:text-emerald-400" : ""
                     }`}
-                    onClick={toggleAllTestModes}
-                    disabled={configs.length === 0}
+                    onClick={openHotModelDialog}
                     title={
-                      allSingle
-                        ? "当前全部为仅测选中，点击一键恢复循环测试"
-                        : "点击把所有卡片一键设为仅测选中（不再自动换模型救场）"
+                      hotOn
+                        ? `循环测试只测 ${hotModels.length} 个热点模型在各站点命中的名字，点击修改`
+                        : "设置热点模型：循环测试只测主力模型，不再整表扫描白烧 token"
                     }
                   >
-                    <FaExchangeAlt aria-hidden />
-                    <span>{allSingle ? "全部循环" : "全部单测"}</span>
+                    <FaFire aria-hidden />
+                    <span>热点模型{hotModels.length > 0 ? ` ${hotModels.length}` : ""}</span>
                   </button>
                 );
               })()}
@@ -4439,6 +5286,250 @@ export default function Home() {
 
       </div>
 
+      {hotModelDialogOpen ? (
+        <div
+          className="fixed inset-0 z-30 flex items-center justify-center bg-zinc-950/35 px-4"
+          onClick={closeHotModelDialog}
+        >
+          <div
+            className="flex max-h-[88vh] w-full max-w-4xl flex-col overflow-hidden rounded-[30px] border border-zinc-200 bg-white p-4 shadow-2xl sm:p-5 dark:border-zinc-700 dark:bg-zinc-900"
+            onClick={(event) => event.stopPropagation()}
+          >
+            {(() => {
+              const keyword = hotModelSearch.trim().toLowerCase();
+              const visibleGroups = hotModelGroups
+                .filter((group) => hotModelVendor === "all" || group.vendor === hotModelVendor)
+                .map((group) => {
+                  const all = [...group.discovered, ...group.seed];
+                  return {
+                    vendor: group.vendor,
+                    label: group.label,
+                    total: all.length,
+                    models: keyword ? all.filter((model) => model.toLowerCase().includes(keyword)) : all,
+                    seedSet: new Set(group.seed)
+                  };
+                })
+                .filter((group) => group.models.length > 0);
+              const vendorChips = [
+                { vendor: "all" as HotVendor | "all", label: "全部", total: hotModelCatalog.length },
+                ...hotModelGroups.map((group) => ({
+                  vendor: group.vendor as HotVendor | "all",
+                  label: group.label,
+                  total: group.discovered.length + group.seed.length
+                }))
+              ];
+              const chipBtn =
+                "inline-flex items-center gap-1 rounded-lg border px-2 py-1 text-xs font-medium transition";
+
+              return (
+                <>
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <p className="inline-flex items-center gap-2 text-base font-semibold text-zinc-900 dark:text-zinc-100">
+                        <FaFire aria-hidden />
+                        <span>热点模型</span>
+                        <HelpHint text="勾选主力模型并保存后，循环测试只测这些模型在各站点命中的名字。一条热点会把该站点上所有真正不同的变体各测一次（同一站点最多 6 个），所以选大版本比逐个挑变体更省事，也不会漏测。" />
+                      </p>
+                      <p className="mt-1 text-sm text-zinc-500">
+                        候选来自你各站点识别到的真实模型（{hotModelCatalog.length} 个）加内置主力模型。默认并到
+                        <span className="font-medium text-zinc-600 dark:text-zinc-300">大版本 + 一级小版本</span>
+                        ，如 glm-5.2、deepseek-v4、gpt-5.1；flash / pro / 日期快照这类变体不单独占一格，
+                        勾一条会把站点上所有「真正不同」的变体都测掉（同一站点最多 6 个），不会漏测。
+                      </p>
+                    </div>
+                    <button type="button" className={smallBtn} onClick={closeHotModelDialog}>
+                      <FaTimesCircle aria-hidden />
+                      <span>关闭</span>
+                    </button>
+                  </div>
+
+                  <label className="mt-3 flex cursor-pointer items-start gap-2 rounded-2xl border border-emerald-200 bg-emerald-50/70 px-3 py-2.5 dark:border-emerald-800 dark:bg-emerald-900/25">
+                    <input
+                      type="checkbox"
+                      className="mt-0.5 h-4 w-4 shrink-0 accent-emerald-600"
+                      checked={hotModelDraftEnabled}
+                      onChange={(e) => setHotModelDraftEnabled(e.target.checked)}
+                    />
+                    <span className="text-sm text-emerald-900 dark:text-emerald-100">
+                      <span className="font-semibold">循环测试只测热点模型</span>
+                      <br />
+                      <span className="text-xs leading-5 text-emerald-800/85 dark:text-emerald-300/85">
+                        开启后每张卡片只测热点列表在该站点命中的模型；一个都没命中时退化为只测配置模型。关掉就回到全量扫描。
+                      </span>
+                    </span>
+                  </label>
+
+                  <div className="mt-3 flex flex-wrap items-center gap-2">
+                    <div className="inline-flex flex-wrap items-center gap-1 rounded-full border border-zinc-200 bg-zinc-50 p-0.5 dark:border-zinc-700 dark:bg-zinc-800/60">
+                      {vendorChips.map((entry) => (
+                        <button
+                          key={entry.vendor}
+                          type="button"
+                          onClick={() => setHotModelVendor(entry.vendor)}
+                          className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-medium transition ${
+                            hotModelVendor === entry.vendor
+                              ? "bg-white text-zinc-900 shadow-sm dark:bg-zinc-900 dark:text-zinc-100"
+                              : "text-zinc-500 hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200"
+                          }`}
+                        >
+                          {entry.label}
+                          <span className="text-[10px] opacity-70">{entry.total}</span>
+                        </button>
+                      ))}
+                    </div>
+                    <div className="inline-flex items-center rounded-full border border-zinc-200 bg-zinc-50 p-0.5 dark:border-zinc-700 dark:bg-zinc-800/60">
+                      {([
+                        {
+                          value: "major" as const,
+                          label: "大版本",
+                          hint: "并到大版本 + 一级小版本，如 glm-5.2、deepseek-v4、gpt-5.1；丢掉 flash / pro / 日期快照等变体"
+                        },
+                        { value: "full" as const, label: "完整型号", hint: "列出站点上每个具体模型名，含 flash / pro / 日期快照等变体" }
+                      ]).map((entry) => (
+                        <button
+                          key={entry.value}
+                          type="button"
+                          onClick={() => setHotModelGranularity(entry.value)}
+                          title={entry.hint}
+                          className={`inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium transition ${
+                            hotModelGranularity === entry.value
+                              ? "bg-white text-zinc-900 shadow-sm dark:bg-zinc-900 dark:text-zinc-100"
+                              : "text-zinc-500 hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200"
+                          }`}
+                        >
+                          {entry.label}
+                        </button>
+                      ))}
+                    </div>
+                    <input
+                      className="w-36 rounded-full border border-zinc-200 bg-white px-2.5 py-1 text-xs outline-none focus:border-emerald-400 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
+                      value={hotModelSearch}
+                      onChange={(e) => setHotModelSearch(e.target.value)}
+                      placeholder="搜索模型"
+                    />
+                    <span className="ml-auto rounded-full bg-zinc-100 px-3 py-1 text-xs font-medium text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300">
+                      已选 {hotModelDraft.length} / {MAX_HOT_MODELS}
+                    </span>
+                  </div>
+
+                  <div className="mt-2 flex items-center gap-2">
+                    <input
+                      className={`${inputClass} h-9 flex-1`}
+                      value={hotModelCustom}
+                      onChange={(e) => setHotModelCustom(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          addHotModelDraft();
+                        }
+                      }}
+                      placeholder="手动添加模型名（回车即可），用于候选列表里没有的写法"
+                    />
+                    <button type="button" className={smallBtn} onClick={addHotModelDraft} disabled={!hotModelCustom.trim()}>
+                      <FaPlus aria-hidden />
+                      <span>添加</span>
+                    </button>
+                  </div>
+
+                  {hotModelDraft.length > 0 ? (
+                    <div className="mt-2 flex flex-wrap items-center gap-1.5 rounded-2xl border border-zinc-200 bg-zinc-50/70 px-2.5 py-2 dark:border-zinc-700 dark:bg-zinc-800/40">
+                      <span className="text-[11px] font-semibold text-zinc-500">已选：</span>
+                      {hotModelDraft.map((model) => (
+                        <button
+                          key={`picked-${model}`}
+                          type="button"
+                          onClick={() => toggleHotModelDraft(model)}
+                          title="点击移除"
+                          className="inline-flex items-center gap-1 rounded-lg border border-emerald-300 bg-white px-2 py-0.5 text-[11px] font-medium text-emerald-700 hover:border-red-300 hover:text-red-600 dark:border-emerald-700 dark:bg-zinc-900 dark:text-emerald-400"
+                        >
+                          <span>{model}</span>
+                          <FaTimesCircle aria-hidden />
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
+
+                  <div className="mt-3 min-h-0 flex-1 overflow-y-auto rounded-2xl border border-zinc-200 dark:border-zinc-700">
+                    {visibleGroups.length === 0 ? (
+                      <p className="px-3 py-8 text-center text-sm text-zinc-500">
+                        没有匹配的模型，换个关键词，或用上面的输入框手动添加
+                      </p>
+                    ) : (
+                      visibleGroups.map((group) => (
+                        <div key={group.vendor} className="border-b border-zinc-100 last:border-b-0 dark:border-zinc-800">
+                          <div className="flex flex-wrap items-center gap-2 bg-zinc-50 px-3 py-2 dark:bg-zinc-800/60">
+                            <span className="text-xs font-semibold text-zinc-700 dark:text-zinc-200">{group.label}</span>
+                            <span className="text-[11px] text-zinc-400">{group.total} 个</span>
+                            <div className="ml-auto flex items-center gap-1.5">
+                              <button
+                                type="button"
+                                className={chipBtn}
+                                onClick={() => toggleHotModelGroup(group.models, true)}
+                              >
+                                全选本组
+                              </button>
+                              <button
+                                type="button"
+                                className={chipBtn}
+                                onClick={() => toggleHotModelGroup(group.models, false)}
+                              >
+                                清空本组
+                              </button>
+                            </div>
+                          </div>
+                          <div className="flex flex-wrap gap-1.5 px-3 py-2.5">
+                            {group.models.map((model) => {
+                              const picked = hotModelDraft.includes(model);
+                              return (
+                                <button
+                                  key={`${group.vendor}-${model}`}
+                                  type="button"
+                                  onClick={() => toggleHotModelDraft(model)}
+                                  title={group.seedSet.has(model) ? `${model}（内置候选，尚未在站点识别结果中出现）` : model}
+                                  className={`inline-flex items-center gap-1.5 rounded-lg border px-2 py-1 text-xs font-medium transition ${
+                                    picked
+                                      ? "border-emerald-400 bg-emerald-50 text-emerald-800 dark:border-emerald-600 dark:bg-emerald-900/30 dark:text-emerald-300"
+                                      : "border-zinc-200 bg-white text-zinc-600 hover:border-zinc-400 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:border-zinc-500"
+                                  } ${group.seedSet.has(model) ? "border-dashed" : ""}`}
+                                >
+                                  {picked ? (
+                                    <FaCheckCircle className="h-3 w-3" aria-hidden />
+                                  ) : (
+                                    <span className="h-3 w-3 rounded-full border border-current opacity-40" aria-hidden />
+                                  )}
+                                  <span>{model}</span>
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+
+                  <div className="mt-3 flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      className={btnGhost}
+                      onClick={() => toggleHotModelGroup(hotModelDraft, false)}
+                      disabled={hotModelDraft.length === 0}
+                    >
+                      <FaTrashAlt aria-hidden />
+                      <span>全部清空</span>
+                    </button>
+                    <p className="ml-auto text-xs text-zinc-500">保存后立即生效，之后每张卡片的循环测试都按这份列表匹配。</p>
+                    <button type="button" className={btnPrimary} onClick={() => void saveHotModels()} disabled={isSavingHotModels}>
+                      {isSavingHotModels ? <FaSpinner className="animate-spin" aria-hidden /> : <FaSave aria-hidden />}
+                      <span>保存热点模型</span>
+                    </button>
+                  </div>
+                </>
+              );
+            })()}
+          </div>
+        </div>
+      ) : null}
+
       {ccSwitchDialogItem ? (
         <div className="fixed inset-0 z-30 flex items-center justify-center bg-zinc-950/35 px-4">
           <div className="w-full max-w-md rounded-3xl border border-zinc-200 bg-white p-4 shadow-2xl dark:border-zinc-700 dark:bg-zinc-900">
@@ -4488,6 +5579,218 @@ export default function Home() {
                 <span>立即唤起</span>
               </button>
             </div>
+          </div>
+        </div>
+      ) : null}
+
+      {modelTestDialogItem ? (
+        <div
+          className="fixed inset-0 z-30 flex items-center justify-center bg-zinc-950/35 px-4"
+          onClick={closeModelTestDialog}
+        >
+          <div
+            className="w-full max-w-5xl rounded-[30px] border border-zinc-200 bg-white p-4 shadow-2xl sm:p-5 dark:border-zinc-700 dark:bg-zinc-900"
+            onClick={(event) => event.stopPropagation()}
+          >
+            {(() => {
+              const entries = modelTestMap[modelTestDialogItem.id] || modelTestDialogItem.modelTests || [];
+              const running =
+                Boolean(loadingMap[modelTestDialogItem.id]) && getConfigTestMode(modelTestDialogItem) === "chain";
+              const okCount = entries.filter((entry) => entry.status === "success").length;
+              const failCount = entries.filter((entry) => entry.status === "error").length;
+              const pendingCount = entries.length - okCount - failCount;
+              const keyword = modelTestSearch.trim().toLowerCase();
+              // 本站点没有的热点条目单独列出来，免得「选了却没测」变成看不见的洞
+              const siteModelList = modelTestDialogItem.probe?.supportedModels || [];
+              const unmatchedHot =
+                hotModelsEnabled && hotModels.length > 0 && siteModelList.length > 0
+                  ? hotModels.filter((hot) => !siteModelList.some((site) => hotModelMatches(hot, site)))
+                  : [];
+              const lastTestedAt = entries
+                .map((entry) => entry.testedAt)
+                .filter((value): value is string => Boolean(value))
+                .pop();
+              const filtered = entries.filter((entry) => {
+                if (modelTestFilter === "success" && entry.status !== "success") return false;
+                if (modelTestFilter === "error" && entry.status !== "error") return false;
+                if (keyword && !entry.model.toLowerCase().includes(keyword)) return false;
+                return true;
+              });
+
+              return (
+                <>
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <p className="inline-flex items-center gap-2 text-base font-semibold text-zinc-900 dark:text-zinc-100">
+                        <FaListAlt aria-hidden />
+                        <span>循环测试明细</span>
+                        <HelpHint text="循环测试会按设定频率把整份模型列表逐个测一遍，这里记录每个模型是否可用。" />
+                      </p>
+                      <p className="mt-1 text-sm text-zinc-500">
+                        {modelTestDialogItem.name}
+                        {lastTestedAt ? ` · 最近测试：${toDateTimeLabel(lastTestedAt)}` : ""}
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      {running ? (
+                        <button
+                          type="button"
+                          className={btnGhost}
+                          onClick={() => stopCycleTest(modelTestDialogItem.id)}
+                          title="停止循环测试（当前模型测完即停）"
+                        >
+                          <FaStopCircle aria-hidden />
+                          <span>停止</span>
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          className={btnPrimary}
+                          onClick={() => void testConfig(modelTestDialogItem)}
+                          disabled={Boolean(loadingMap[modelTestDialogItem.id])}
+                          title={
+                            getConfigTestMode(modelTestDialogItem) === "chain"
+                              ? "按当前间隔重新扫一遍整份模型列表"
+                              : "该卡片当前为仅测选中，只会测配置/推荐的模型"
+                          }
+                        >
+                          <FaBolt aria-hidden />
+                          <span>再跑一轮</span>
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        className={btnGhost}
+                        disabled={entries.length === 0}
+                        onClick={() =>
+                          void copyText(
+                            entries
+                              .map(
+                                (entry) =>
+                                  [
+                                    entry.model,
+                                    entry.status === "success" ? "成功" : entry.status === "error" ? "失败" : "未测完",
+                                    entry.elapsedMs ? formatDurationLabel(entry.elapsedMs) : "-",
+                                    entry.detail || ""
+                                  ].join("\t")
+                              )
+                              .join("\n"),
+                            "已复制循环测试明细"
+                          )
+                        }
+                      >
+                        <FaCopy aria-hidden />
+                        <span>复制明细</span>
+                      </button>
+                      <button type="button" className={smallBtn} onClick={closeModelTestDialog}>
+                        <FaTimesCircle aria-hidden />
+                        <span>关闭</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="mt-3 flex flex-wrap items-center gap-2">
+                    <span className="rounded-full bg-emerald-50 px-3 py-1 text-xs font-semibold text-emerald-700">
+                      成功 {okCount}
+                    </span>
+                    <span className="rounded-full bg-red-50 px-3 py-1 text-xs font-semibold text-red-600">
+                      失败 {failCount}
+                    </span>
+                    <span className="rounded-full bg-amber-50 px-3 py-1 text-xs font-semibold text-amber-700">
+                      未完成 {pendingCount}
+                    </span>
+                    <span className="rounded-full bg-zinc-100 px-3 py-1 text-xs font-medium text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300">
+                      共 {entries.length} 个 · 间隔 {getConfigCycleIntervalSec(modelTestDialogItem)} 秒
+                    </span>
+                    <div className="ml-auto inline-flex flex-wrap items-center gap-1 rounded-full border border-zinc-200 bg-zinc-50 p-0.5 dark:border-zinc-700 dark:bg-zinc-800/60">
+                      {(["all", "success", "error"] as ModelTestFilter[]).map((value) => (
+                        <button
+                          key={value}
+                          type="button"
+                          onClick={() => setModelTestFilter(value)}
+                          className={`inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium transition ${
+                            modelTestFilter === value
+                              ? "bg-white text-zinc-900 shadow-sm dark:bg-zinc-900 dark:text-zinc-100"
+                              : "text-zinc-500 hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200"
+                          }`}
+                        >
+                          {value === "all" ? "全部" : value === "success" ? "仅成功" : "仅失败"}
+                        </button>
+                      ))}
+                      <input
+                        className="w-32 rounded-full border border-zinc-200 bg-white px-2.5 py-1 text-xs outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
+                        value={modelTestSearch}
+                        onChange={(e) => setModelTestSearch(e.target.value)}
+                        placeholder="搜索模型"
+                      />
+                    </div>
+                  </div>
+
+                  {unmatchedHot.length > 0 ? (
+                    <div className="mt-3 rounded-2xl border border-amber-200 bg-amber-50/70 px-3 py-2 dark:border-amber-800 dark:bg-amber-900/20">
+                      <p className="text-xs font-semibold text-amber-800 dark:text-amber-300">
+                        本站点没有这些热点模型（{unmatchedHot.length} 个，不占用测试次数）
+                      </p>
+                      <div className="mt-1.5 flex flex-wrap gap-1.5">
+                        {unmatchedHot.map((model) => (
+                          <span
+                            key={`unmatched-${model}`}
+                            className="rounded-lg border border-amber-200 bg-white px-2 py-0.5 text-[11px] text-amber-700 dark:border-amber-800 dark:bg-zinc-900 dark:text-amber-400"
+                          >
+                            {model}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+
+                  <div className="mt-3 overflow-hidden rounded-2xl border border-zinc-200 dark:border-zinc-700">
+                    <div className="grid grid-cols-[2.5rem_minmax(0,1.4fr)_5.5rem_5rem_minmax(0,1.6fr)] gap-2 border-b border-zinc-200 bg-zinc-50 px-3 py-2 text-xs font-semibold text-zinc-500 dark:border-zinc-700 dark:bg-zinc-800/60">
+                      <span>#</span>
+                      <span>模型名称</span>
+                      <span>结果</span>
+                      <span>耗时</span>
+                      <span>详情</span>
+                    </div>
+                    <div className="max-h-[52vh] overflow-y-auto">
+                      {filtered.length === 0 ? (
+                        <p className="px-3 py-6 text-center text-sm text-zinc-500">暂无符合条件的模型结果</p>
+                      ) : (
+                        filtered.map((entry, index) => (
+                          <div
+                            key={`${entry.model}-${index}`}
+                            className="grid grid-cols-[2.5rem_minmax(0,1.4fr)_5.5rem_5rem_minmax(0,1.6fr)] items-start gap-2 border-b border-zinc-100 px-3 py-2 text-xs last:border-b-0 dark:border-zinc-800"
+                          >
+                            <span className="text-zinc-400">{index + 1}</span>
+                            <span className="break-all font-medium text-zinc-800 dark:text-zinc-100">{entry.model}</span>
+                            <span
+                              className={`inline-flex w-fit items-center gap-1 rounded-full px-2 py-0.5 font-semibold ${statusPillClass(entry.status)}`}
+                            >
+                              <StatusIcon status={entry.status} />
+                              <span>{entry.status === "success" ? "成功" : entry.status === "error" ? "失败" : "未测完"}</span>
+                            </span>
+                            <span className="text-zinc-500">
+                              {entry.elapsedMs ? formatDurationLabel(entry.elapsedMs) : "-"}
+                            </span>
+                            <span className="break-words text-zinc-500" title={entry.detail || ""}>
+                              {entry.detail ? cleanOneLineText(entry.detail, 120) : "-"}
+                            </span>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+
+                  <p className="mt-2 text-xs leading-5 text-zinc-500">
+                    节奏为「同一供应商每 {getConfigCycleIntervalSec(modelTestDialogItem)} 秒测一个模型」，站点有 RPM
+                    限制时把卡片或顶部的循环间隔调大即可。
+                    {hotModelsEnabled && hotModels.length > 0
+                      ? `当前已开启热点模型：只测 ${hotModels.length} 个热点模型在本站点命中的名字。`
+                      : ""}
+                  </p>
+                </>
+              );
+            })()}
           </div>
         </div>
       ) : null}

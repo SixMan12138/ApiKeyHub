@@ -31,6 +31,8 @@ const BENCH_TIMEOUT_MS = 30_000;
 const STREAM_IDLE_TIMEOUT_MS = 30_000;
 // 整体测试最长耗时：候选模型链 + 瞬时错误重试的总上限
 const TEST_OVERALL_DEADLINE_MS = 420_000;
+// 循环测试逐模型扫描时的单次上限：只测一个模型，不需要候选链那么宽的预算
+const SWEEP_TEST_DEADLINE_MS = 100_000;
 const TRANSIENT_RETRY_DELAY_MS = 10_000;
 // 候选链只在配置未指定模型时启用，避免死站点把一次测试拖得过久
 const MAX_MODEL_CANDIDATE_TRIES = 4;
@@ -908,6 +910,9 @@ export async function runOpenAITest(input: OpenAIProxyTestRequest): Promise<Open
   const apiKey = cleanKey(input.apiKey);
   const testedAt = new Date().toISOString();
   const prompt = "你是谁？请用一句简短中文回复，不要使用 Markdown。";
+  // 循环测试扫描模式：单模型、少请求、不整体重试
+  const sweepMode = input.sweep === true;
+  const startedAt = performance.now();
 
   if (!baseUrl || !apiKey) {
     return {
@@ -950,15 +955,20 @@ export async function runOpenAITest(input: OpenAIProxyTestRequest): Promise<Open
       const streamResponse = await requestModelTextStream(baseUrl, apiKey, model, prompt, TEST_MAX_TOKENS, streamTimeoutMs);
       attempts.push({ ...streamResponse, source: "stream" });
 
-      if (!(streamResponse.ok && !isLowSignalResponseText(streamResponse.text))) {
+      // 扫描模式下流式已经出话就不再补测，控制单个站点的请求密度
+      const streamUsable = sweepMode
+        ? streamResponse.ok
+        : streamResponse.ok && !isLowSignalResponseText(streamResponse.text);
+
+      if (!streamUsable) {
         const chatResponse = await requestModelText(baseUrl, apiKey, model, prompt, TEST_MAX_TOKENS, chatTimeoutMs);
         attempts.push({ ...chatResponse, source: "chat" });
 
         const shouldTryResponses =
-          !chatResponse.ok ||
-          isLowSignalResponseText(chatResponse.text) ||
+          chatResponse.error === "未返回消息内容" ||
           shouldTryResponsesFallback(streamResponse.error || "") ||
-          shouldTryResponsesFallback(chatResponse.error || "");
+          shouldTryResponsesFallback(chatResponse.error || "") ||
+          (!sweepMode && (!chatResponse.ok || isLowSignalResponseText(chatResponse.text)));
 
         if (shouldTryResponses) {
           const responsesResponse = await requestResponsesText(baseUrl, apiKey, model, prompt, chatTimeoutMs);
@@ -1014,11 +1024,12 @@ export async function runOpenAITest(input: OpenAIProxyTestRequest): Promise<Open
     return { best: undefined, errors, sawTransientError, attempts: lastAttempts };
   }
 
-  const deadlineAt = Date.now() + TEST_OVERALL_DEADLINE_MS;
+  const deadlineAt = Date.now() + (sweepMode ? SWEEP_TEST_DEADLINE_MS : TEST_OVERALL_DEADLINE_MS);
   let evaluation = await evaluateCandidates();
 
-  // 瞬时错误（超时/限流/网络抖动）不直接判死，延迟后整体再试一次
-  if (!evaluation.best && evaluation.sawTransientError && Date.now() < deadlineAt) {
+  // 瞬时错误（超时/限流/网络抖动）不直接判死，延迟后整体再试一次；
+  // 扫描模式把重试交给下一轮循环，单次请求不额外占用站点配额
+  if (!sweepMode && !evaluation.best && evaluation.sawTransientError && Date.now() < deadlineAt) {
     await delay(TRANSIENT_RETRY_DELAY_MS);
     evaluation = await evaluateCandidates();
   }
@@ -1043,6 +1054,7 @@ export async function runOpenAITest(input: OpenAIProxyTestRequest): Promise<Open
         responseText: bestResponse.text || undefined,
         responseSource: bestResponse.source,
         testedAt,
+        elapsedMs: Math.round(performance.now() - startedAt),
       },
     };
   }
@@ -1059,7 +1071,9 @@ export async function runOpenAITest(input: OpenAIProxyTestRequest): Promise<Open
       status: "error",
       message: FAIL_TEXT,
       detail,
+      model: requestedModel || undefined,
       testedAt,
+      elapsedMs: Math.round(performance.now() - startedAt),
     },
   };
 }

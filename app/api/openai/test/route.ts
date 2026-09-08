@@ -23,6 +23,7 @@ export async function POST(request: NextRequest) {
         model: typeof body.model === "string" ? body.model : "",
         apiFormat: body.apiFormat === "chat" || body.apiFormat === "responses" || body.apiFormat === "messages" ? body.apiFormat : "auto",
         fallbackModels,
+        sweep: body.sweep === true,
       }),
     );
   } catch {
