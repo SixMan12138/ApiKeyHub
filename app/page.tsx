@@ -20,6 +20,7 @@ import {
   FaFire,
   FaInfoCircle,
   FaKey,
+  FaLayerGroup,
   FaLink,
   FaListAlt,
   FaMagic,
@@ -413,6 +414,21 @@ function majorModelName(raw: string): string {
   if (!version || version.index === undefined) return normalized;
 
   return `${normalized.slice(0, version.index)}${version[1]}`;
+}
+
+// 站点卡片名称前缀聚合：按 `-`、`_`、`/`、空格 提取通用站点品牌
+// 例如 "黑白公益-def", "黑白公益-gemini", "黑白公益-glm" -> 聚合成 "黑白公益"
+function extractSiteGroupPrefix(name: string): string {
+  const trimmed = (name || "").trim();
+  if (!trimmed) return "其他";
+
+  const sepMatch = /^([^-_\s/]+)[-_\s/]/.exec(trimmed);
+  if (sepMatch && sepMatch[1].length >= 2) return sepMatch[1];
+
+  const gongyiMatch = /^(.+?公益)/.exec(trimmed);
+  if (gongyiMatch) return gongyiMatch[1];
+
+  return trimmed;
 }
 const MODEL_TAG_RULES: { tag: string; patterns: RegExp[] }[] = [
   { tag: "image", patterns: [/\bimage\b/i, /\bvision\b/i, /\bvl\b/i, /\bflux\b/i, /\bsd(?:xl)?\b/i, /stable[- ]?diffusion/i] },
@@ -2274,6 +2290,28 @@ export default function Home() {
   const activeCount = activeConfigs.length;
   const activeCollapsedCount = activeConfigs.filter((item) => isConfigCollapsed(item.id)).length;
   const activeAllCollapsed = activeCount > 0 && activeCollapsedCount === activeCount;
+
+  // 卡片按名称前缀聚合分组
+  const [groupByPrefix, setGroupByPrefix] = useState(true);
+  const [collapsedGroupPrefixes, setCollapsedGroupPrefixes] = useState<Record<string, boolean>>({});
+
+  function toggleGroupPrefixCollapse(prefix: string) {
+    setCollapsedGroupPrefixes((prev) => ({ ...prev, [prefix]: !prev[prefix] }));
+  }
+
+  const activeConfigGroups = useMemo(() => {
+    const map = new Map<string, KeyConfig[]>();
+    for (const item of activeConfigs) {
+      const p = extractSiteGroupPrefix(item.name);
+      if (!map.has(p)) map.set(p, []);
+      map.get(p)!.push(item);
+    }
+    return Array.from(map.entries()).map(([prefix, items]) => ({
+      prefix,
+      items,
+      multi: items.length > 1
+    }));
+  }, [activeConfigs]);
 
   // 搜索匹配：按名称模糊匹配，最多展示 8 条候选
   const searchMatches = useMemo(() => {
@@ -5089,6 +5127,19 @@ export default function Home() {
               </button>
               <button
                 type="button"
+                className={`${topBtnGhost} ${
+                  groupByPrefix
+                    ? "border-emerald-400 text-emerald-700 dark:border-emerald-600 dark:text-emerald-400"
+                    : ""
+                }`}
+                onClick={() => setGroupByPrefix((prev) => !prev)}
+                title={groupByPrefix ? "当前已开启前缀聚合（同名前缀卡片聚在一起），点击恢复平铺列表" : "点击开启同名前缀聚合折叠"}
+              >
+                <FaLayerGroup aria-hidden />
+                <span>{groupByPrefix ? "前缀聚合中" : "前缀聚合"}</span>
+              </button>
+              <button
+                type="button"
                 className={topBtnGhost}
                 onClick={collapseActiveAll}
                 disabled={activeCount === 0 || activeAllCollapsed}
@@ -5285,9 +5336,73 @@ export default function Home() {
                     : "暂无配置"}
             </p>
           ) : (
-            <ul className="grid max-h-full min-w-0 grid-cols-1 gap-2.5 overflow-y-auto pr-1 [-ms-overflow-style:none] [scrollbar-width:thin]">
-              {activeConfigs.map((item) => renderConfigCard(item))}
-            </ul>
+            <div className="max-h-full min-w-0 space-y-3 overflow-y-auto pr-1 [-ms-overflow-style:none] [scrollbar-width:thin]">
+              {groupByPrefix ? (
+                activeConfigGroups.map((group) => {
+                  if (!group.multi) {
+                    return (
+                      <ul key={group.prefix} className="grid grid-cols-1 gap-2.5">
+                        {group.items.map((item) => renderConfigCard(item))}
+                      </ul>
+                    );
+                  }
+                  const isGroupFolded = Boolean(collapsedGroupPrefixes[group.prefix]);
+                  const successCount = group.items.filter((c) => getConfigListStatus(c) === "success").length;
+                  const failedCount = group.items.filter((c) => getConfigListStatus(c) === "failed").length;
+                  return (
+                    <div
+                      key={group.prefix}
+                      className="rounded-2xl border border-zinc-200/90 bg-zinc-50/60 p-2.5 transition dark:border-zinc-800 dark:bg-zinc-800/30"
+                    >
+                      <div
+                        className="group/gh flex cursor-pointer select-none items-center justify-between gap-2 px-1 py-1"
+                        onClick={() => toggleGroupPrefixCollapse(group.prefix)}
+                        role="button"
+                        tabIndex={0}
+                        aria-expanded={!isGroupFolded}
+                      >
+                        <div className="flex min-w-0 items-center gap-2">
+                          <span className="inline-flex h-5 w-5 shrink-0 items-center justify-center text-zinc-400 transition-transform duration-200 group-hover/gh:text-emerald-600 dark:text-zinc-500 dark:group-hover/gh:text-emerald-400">
+                            <span className={`transition-transform duration-200 ${isGroupFolded ? "-rotate-90" : ""}`}>
+                              <FaChevronDown aria-hidden />
+                            </span>
+                          </span>
+                          <span className="text-sm font-bold text-zinc-800 dark:text-zinc-200">
+                            {group.prefix}
+                          </span>
+                          <span className="rounded-full bg-zinc-200/80 px-2 py-0.5 text-xs font-semibold text-zinc-600 dark:bg-zinc-700 dark:text-zinc-300">
+                            {group.items.length} 张卡片
+                          </span>
+                          {successCount > 0 ? (
+                            <span className="rounded-full bg-emerald-100/80 px-2 py-0.5 text-[11px] font-medium text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300">
+                              成功 {successCount}
+                            </span>
+                          ) : null}
+                          {failedCount > 0 ? (
+                            <span className="rounded-full bg-red-100/80 px-2 py-0.5 text-[11px] font-medium text-red-700 dark:bg-red-900/40 dark:text-red-300">
+                              失败 {failedCount}
+                            </span>
+                          ) : null}
+                        </div>
+                        <div className="flex items-center gap-1.5 text-xs text-zinc-400 group-hover/gh:text-zinc-600 dark:group-hover/gh:text-zinc-300">
+                          <span>{isGroupFolded ? "点击展开分组" : "点击折叠分组"}</span>
+                        </div>
+                      </div>
+
+                      {!isGroupFolded ? (
+                        <ul className="mt-2 grid grid-cols-1 gap-2.5">
+                          {group.items.map((item) => renderConfigCard(item))}
+                        </ul>
+                      ) : null}
+                    </div>
+                  );
+                })
+              ) : (
+                <ul className="grid grid-cols-1 gap-2.5">
+                  {activeConfigs.map((item) => renderConfigCard(item))}
+                </ul>
+              )}
+            </div>
           )}
         </section>
 
