@@ -353,7 +353,10 @@ function pickHotMatchedModels(siteModels: string[], hotModels: string[]): string
 }
 // 一条热点在一个站点上最多测几个变体，防止个别站点把一个版本铺成几十个马甲
 const MAX_HOT_VARIANTS = 6;
-// 这些 token 不代表不同模型：免费镜像、别名、思考档位（high / medium / low）
+// 这些 token 不代表不同模型：免费镜像、别名、同版本重复上架。
+// 注意：high / medium / low / minimal 这类思考档位**算不同模型**，不能收进来。
+// 黑白公益-gemini 的 gemini-3.7-flash-high 与 -medium 就是这么被吞掉的——
+// 它们在站点上是各自独立上架的模型名，收了就等于永远测不到。
 const MODEL_NOISE_TOKENS = new Set([
   "free",
   "latest",
@@ -364,13 +367,11 @@ const MODEL_NOISE_TOKENS = new Set([
   "rc",
   "test",
   "new",
-  "default",
-  "high",
-  "medium",
-  "low",
-  "minimal",
-  "none"
+  "default"
 ]);
+// 娱乐 / 套壳占位模型：中转站整批挂在一个恶搞前缀下（如「只会喵喵叫/gpt-5.6-sol」），
+// 名字看着像真模型、实际只会喵喵叫，测了纯属白烧 token，统一不测也不进候选。
+const JUNK_MODEL_PATTERN = /喵|meow|\bnya(?:n)?\b|猫娘|neko|汪汪|woof|\bbark\b/i;
 // 变体指纹：丢掉日期快照号、上下文长度标记（1M / 200k）和噪声词之后剩下的部分。
 // 于是 deepseek-v4-flash 与 deepseek-v4-flash-0731 算同一个，
 // 而 qwen3.8-27b 与 qwen3.8-flash、glm-5.2-fast 与 glm-5.2-think 算不同模型
@@ -1418,11 +1419,17 @@ function isLikelyChatBenchmarkable(model: string, tags?: string[]): boolean {
   const normalized = model.trim().toLowerCase();
   const resolvedTags = tags || inferModelTags(model);
 
+  // 恶搞/占位模型先拦掉：名字里带真模型也照样不是给对话用的
+  if (JUNK_MODEL_PATTERN.test(normalized)) return false;
+
+  // 语音合成 / 转录类同样不测：/chat/completions 上它们要么报错要么返回空内容
+  if (resolvedTags.includes("audio")) return false;
+
   if (resolvedTags.includes("embedding") || resolvedTags.includes("image") || resolvedTags.includes("rerank") || resolvedTags.includes("moderation")) {
     return false;
   }
 
-  return !/(whisper|transcri|text-embedding|embedding-|rerank|stable-diffusion|sdxl|flux|moderation)/i.test(normalized);
+  return !/(whisper|transcri|text-embedding|embedding-|rerank|stable-diffusion|sdxl|flux|moderation|tts)/i.test(normalized);
 }
 
 function medianOf(values: number[]): number {
