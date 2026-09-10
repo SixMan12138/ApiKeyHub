@@ -520,9 +520,24 @@ function normalizeBaseUrl(raw: string): string {
   return cleaned;
 }
 
-// 批量测试/探测限流：免费公益站共享渠道有 RPM 限制，全量并发展发容易触发限流和排队超时
-const BATCH_TASK_CONCURRENCY = 2;
+// 批量测试/探测限流：RPM 通常按上游站点（同一 baseUrl origin）计数，
+// 因此同一站点内的卡片要限并发+错峰，避免共享渠道触发限流和排队超时；
+// 不同站点之间互不占用对方的 RPM 份额，可以并行，但保留一个全局并发上限，
+// 防止浏览器连接数或本机/上游总负载一次性被打满。
+const BATCH_PER_SITE_CONCURRENCY = 2;
+const BATCH_GLOBAL_CONCURRENCY = 8;
 const BATCH_TASK_STAGGER_MS = 1500;
+
+function siteGroupKey(item: KeyConfig): string {
+  const normalized = normalizeBaseUrl(item.baseUrl);
+  if (!normalized) return "unknown";
+  try {
+    const url = new URL(normalized);
+    return `${url.protocol}//${url.host}`;
+  } catch {
+    return normalized;
+  }
+}
 
 async function runBatchWithConcurrency<T>(
   items: KeyConfig[],
@@ -531,20 +546,60 @@ async function runBatchWithConcurrency<T>(
   const total = items.length;
   if (total === 0) return [];
 
-  const results: T[] = new Array(total);
-  let cursor = 0;
-
-  const runLane = async (laneIndex: number) => {
-    // 各车道错开起步，避免同一秒内向同一批站点齐射
-    await new Promise((resolve) => window.setTimeout(resolve, laneIndex * BATCH_TASK_STAGGER_MS));
-    while (cursor < total) {
-      const index = cursor;
-      cursor += 1;
-      results[index] = await worker(items[index]);
+  // 按站点分组，保持原有顺序；同一站点内的卡片共享一个限流池
+  const groups = new Map<string, { item: KeyConfig; index: number }[]>();
+  const groupOrder: string[] = [];
+  for (let index = 0; index < total; index += 1) {
+    const key = siteGroupKey(items[index]);
+    let g = groups.get(key);
+    if (!g) {
+      g = [];
+      groups.set(key, g);
+      groupOrder.push(key);
     }
+    g.push({ item: items[index], index });
+  }
+
+  const results: T[] = new Array(total);
+
+  // 全局并发信号量：不同站点可并行，但同一时刻在飞请求不能超过上限
+  let active = 0;
+  const waiting: (() => void)[] = [];
+  const acquire = async () => {
+    if (active < BATCH_GLOBAL_CONCURRENCY) {
+      active += 1;
+      return;
+    }
+    await new Promise<void>((resolve) => waiting.push(resolve));
+  };
+  const release = () => {
+    const next = waiting.shift();
+    if (next) next();
+    else active -= 1;
   };
 
-  await Promise.all(Array.from({ length: Math.min(BATCH_TASK_CONCURRENCY, total) }, (_, lane) => runLane(lane)));
+  const runGroup = async (g: { item: KeyConfig; index: number }[]) => {
+    let cursor = 0;
+    const runLane = async (laneIndex: number) => {
+      // 同站点内的车道错开起步，避免同一秒内向同站点齐射
+      await new Promise((resolve) => window.setTimeout(resolve, laneIndex * BATCH_TASK_STAGGER_MS));
+      while (cursor < g.length) {
+        const { item, index } = g[cursor];
+        cursor += 1;
+        await acquire();
+        try {
+          results[index] = await worker(item);
+        } finally {
+          release();
+        }
+      }
+    };
+
+    const laneCount = Math.min(BATCH_PER_SITE_CONCURRENCY, g.length);
+    await Promise.all(Array.from({ length: laneCount }, (_, lane) => runLane(lane)));
+  };
+
+  await Promise.all(groupOrder.map((key) => runGroup(groups.get(key)!)));
   return results;
 }
 
