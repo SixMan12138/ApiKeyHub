@@ -332,7 +332,9 @@ function hotModelMatches(hotName: string, siteName: string): boolean {
   return site.replace(/-/g, "").includes(hot.replace(/-/g, ""));
 }
 // 一条热点要测站点上所有「真正不同」的变体。霸气公益上 qwen3.8 同时有 27b 和 flash 两个模型，
-// 只取一个测就会漏掉另一个；变体之间用 modelVariantKey 去重，日期快照/免费标记不算不同模型。
+// 只取一个测就会漏掉另一个；变体之间用 variantKeyWithOrgPrefix 去重，日期快照/免费标记不算不同模型。
+// org 前缀参与指纹：deepseek-ai/deepseek-v4-flash-0731 与 deepseek-v4-flash 是独立上架的两个模型名，
+// 都命中热点 deepseek-v4，循环测试两个都要测，不能被互相合并掉一个
 function pickHotMatchedModels(siteModels: string[], hotModels: string[]): string[] {
   const ordered = [...siteModels].sort(compareModelNewestFirst);
   const matched: string[] = [];
@@ -341,11 +343,9 @@ function pickHotMatchedModels(siteModels: string[], hotModels: string[]): string
     const perVariant = new Map<string, string>();
     for (const site of ordered) {
       if (!hotModelMatches(hot, site)) continue;
-      const key = modelVariantKey(site);
+      const key = variantKeyWithOrgPrefix(site);
       const current = perVariant.get(key);
-      // 同一变体在站点上常有多个上架名（裸名 + org 前缀 / 日期快照镜像）：
-      // 优先保留「更裸」的名字，避免可用的 deepseek-v4-flash 被
-      // deepseek-ai/deepseek-v4-flash-0731 这类镜像名挤掉导致漏测
+      // 同一指纹内（同前缀同名，如两个日期快照）优先保留「更裸」的上架名
       if (current === undefined || isCleanerModelName(site, current)) {
         perVariant.set(key, site);
       }
@@ -356,14 +356,14 @@ function pickHotMatchedModels(siteModels: string[], hotModels: string[]): string
   // 多条热点可能命中同一个模型（qwen3.8 与 qwen-3.8），去重避免重复请求
   return uniqueStrings(matched);
 }
-// 同一变体的多个上架名里挑「最裸」的：分数越低越干净。带 org 前缀（xxx/）是最大劣项，
+// 同一指纹内的多个上架名里挑「更裸」的：分数越低越干净。
 // 日期/规格尾巴（-0731、-1m、-free）次之，最后比归一化后的总长度。
-// 目的是循环测试优先请求站点的裸模型名，而不是可能过期/不可用的镜像名。
+// 只在「同前缀同名」的内部比较，跨前缀不互相淘汰。
 function isCleanerModelName(candidate: string, current: string): boolean {
   const score = (raw: string): number => {
     const normalized = normalizeModelKey(raw);
     const key = modelVariantKey(raw);
-    return (raw.includes("/") ? 10000 : 0) + (normalized.length - key.length) * 10 + normalized.length;
+    return (normalized.length - key.length) * 10 + normalized.length;
   };
   return score(candidate) < score(current);
 }
@@ -396,6 +396,15 @@ function modelVariantKey(name: string): string {
     .split("-")
     .filter((token) => token && !/^\d{3,}$/.test(token) && !/^\d+[km]$/i.test(token) && !MODEL_NOISE_TOKENS.has(token))
     .join("-");
+}
+// 变体指纹（含 org 前缀）：模型名带厂家前缀（deepseek-ai/...、z-ai/...）时，
+// 前缀保留在指纹里，于是 deepseek-ai/deepseek-v4-flash-0731 与 deepseek-v4-flash
+// 是两个独立变体、都要测；而同一前缀下的 -0731 与 -0801 仍按 modelVariantKey 合并
+function variantKeyWithOrgPrefix(name: string): string {
+  const slash = name.lastIndexOf("/");
+  if (slash < 0) return modelVariantKey(name);
+  const org = normalizeModelKey(name.slice(0, slash));
+  return `${org}/${modelVariantKey(name.slice(slash + 1))}`;
 }
 // 开了热点模型时，模型列表超过这个时长就先刷一次：站点新上的模型不在旧列表里，
 // 是「热点选了却测不到」的另一大来源。/models 不消耗 token，宁可多刷
