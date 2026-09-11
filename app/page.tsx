@@ -342,15 +342,30 @@ function pickHotMatchedModels(siteModels: string[], hotModels: string[]): string
     for (const site of ordered) {
       if (!hotModelMatches(hot, site)) continue;
       const key = modelVariantKey(site);
-      if (perVariant.has(key)) continue;
-      perVariant.set(key, site);
-      if (perVariant.size >= MAX_HOT_VARIANTS) break;
+      const current = perVariant.get(key);
+      // 同一变体在站点上常有多个上架名（裸名 + org 前缀 / 日期快照镜像）：
+      // 优先保留「更裸」的名字，避免可用的 deepseek-v4-flash 被
+      // deepseek-ai/deepseek-v4-flash-0731 这类镜像名挤掉导致漏测
+      if (current === undefined || isCleanerModelName(site, current)) {
+        perVariant.set(key, site);
+      }
     }
-    matched.push(...perVariant.values());
+    matched.push(...Array.from(perVariant.values()).slice(0, MAX_HOT_VARIANTS));
   }
 
   // 多条热点可能命中同一个模型（qwen3.8 与 qwen-3.8），去重避免重复请求
   return uniqueStrings(matched);
+}
+// 同一变体的多个上架名里挑「最裸」的：分数越低越干净。带 org 前缀（xxx/）是最大劣项，
+// 日期/规格尾巴（-0731、-1m、-free）次之，最后比归一化后的总长度。
+// 目的是循环测试优先请求站点的裸模型名，而不是可能过期/不可用的镜像名。
+function isCleanerModelName(candidate: string, current: string): boolean {
+  const score = (raw: string): number => {
+    const normalized = normalizeModelKey(raw);
+    const key = modelVariantKey(raw);
+    return (raw.includes("/") ? 10000 : 0) + (normalized.length - key.length) * 10 + normalized.length;
+  };
+  return score(candidate) < score(current);
 }
 // 一条热点在一个站点上最多测几个变体，防止个别站点把一个版本铺成几十个马甲
 const MAX_HOT_VARIANTS = 6;
