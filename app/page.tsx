@@ -226,7 +226,7 @@ function normalizeApiFormat(input: unknown): OpenAIProxyApiFormat {
   if (input === "chat" || input === "responses" || input === "messages" || input === "auto") return input;
   return "auto";
 }
-type ModelCategory = "gpt" | "claude" | "glm" | "deepseek" | "gemini" | "grok" | "mimo" | "moonshot" | "minimax" | "other";
+type ModelCategory = "gpt" | "claude" | "glm" | "deepseek" | "gemini" | "grok" | "mimo" | "moonshot" | "minimax" | "qwen" | "other";
 type ModelCategoryFilter = ModelCategory | "all";
 const MODEL_CATEGORY_RULES: { category: ModelCategory; patterns: RegExp[] }[] = [
   { category: "gpt", patterns: [/\bgpt\b/i, /\bo1\b/i, /\bo3\b/i, /\bo4\b/i, /openai/i, /chatgpt/i] },
@@ -237,7 +237,8 @@ const MODEL_CATEGORY_RULES: { category: ModelCategory; patterns: RegExp[] }[] = 
   { category: "grok", patterns: [/grok/i, /\bxai\b/i] },
   { category: "mimo", patterns: [/mimo/i] },
   { category: "moonshot", patterns: [/moonshot/i, /\bkimi\b/i] },
-  { category: "minimax", patterns: [/minimax/i, /\babab/i] }
+  { category: "minimax", patterns: [/minimax/i, /\babab/i] },
+  { category: "qwen", patterns: [/qwen/i, /tongyi/i, /qwq/i] }
 ];
 const MODEL_CATEGORY_OPTIONS: { value: ModelCategoryFilter; label: string }[] = [
   { value: "all", label: "全部" },
@@ -250,6 +251,7 @@ const MODEL_CATEGORY_OPTIONS: { value: ModelCategoryFilter; label: string }[] = 
   { value: "mimo", label: "Mimo" },
   { value: "moonshot", label: "Moonshot" },
   { value: "minimax", label: "MiniMax" },
+  { value: "qwen", label: "Qwen" },
   { value: "other", label: "其他" }
 ];
 function inferModelCategory(model: string): ModelCategory {
@@ -283,8 +285,8 @@ const HOT_MODEL_SEED: string[] = [
   "qwen3-max",
   "mimo-v2-flash"
 ];
-// 热点弹窗按厂家分组，比列表筛选多拆一个 Qwen，避免主力国产模型挤进「其他」
-type HotVendor = ModelCategory | "qwen";
+// 热点弹窗与列表筛选共用厂家分类（含 Qwen）
+type HotVendor = ModelCategory;
 const HOT_MODEL_VENDOR_ORDER: { vendor: HotVendor; label: string }[] = [
   { vendor: "gpt", label: "OpenAI / GPT" },
   { vendor: "claude", label: "Anthropic / Claude" },
@@ -299,7 +301,6 @@ const HOT_MODEL_VENDOR_ORDER: { vendor: HotVendor; label: string }[] = [
   { vendor: "other", label: "其他" }
 ];
 function inferHotVendor(model: string): HotVendor {
-  if (/\bqwen\b/i.test(model) || /qwen/i.test(model) || /tongyi/i.test(model)) return "qwen";
   return inferModelCategory(model);
 }
 // 中转站模型名常见形态：org/name、下划线、日期后缀，比对前先归一化
@@ -5794,12 +5795,29 @@ export default function Home() {
             onClick={(event) => event.stopPropagation()}
           >
             {(() => {
-              const entries = modelTestMap[modelTestDialogItem.id] || modelTestDialogItem.modelTests || [];
+              const savedEntries = modelTestMap[modelTestDialogItem.id] || modelTestDialogItem.modelTests || [];
               const running =
                 Boolean(loadingMap[modelTestDialogItem.id]) && getConfigTestMode(modelTestDialogItem) === "chain";
+              // 循环测试列表以「当前热点命中」为准，而不是只展示上次跑完的结果：
+              // 否则刚勾上的 qwen3.8 已经能命中站点的 qwen3.8-flash，弹窗里却看不见
+              const planned =
+                getConfigTestMode(modelTestDialogItem) === "chain" ? collectCycleModels(modelTestDialogItem) : [];
+              const savedByModel = new Map(savedEntries.map((entry) => [entry.model, entry]));
+              const entries =
+                planned.length > 0
+                  ? planned.map(
+                      (model) =>
+                        savedByModel.get(model) || {
+                          model,
+                          status: "idle" as TestStatus,
+                          detail: hotFilterActive() ? "已命中热点，尚未测试" : "尚未测试"
+                        }
+                    )
+                  : savedEntries;
               const okCount = entries.filter((entry) => entry.status === "success").length;
               const failCount = entries.filter((entry) => entry.status === "error").length;
-              const pendingCount = entries.length - okCount - failCount;
+              const pendingCount = entries.filter((entry) => entry.status === "pending").length;
+              const idleCount = entries.filter((entry) => entry.status === "idle").length;
               const keyword = modelTestSearch.trim().toLowerCase();
               // 本站点没有的热点条目单独列出来，免得「选了却没测」变成看不见的洞
               const siteModelList = modelTestDialogItem.probe?.supportedModels || [];
@@ -5870,7 +5888,13 @@ export default function Home() {
                                 (entry) =>
                                   [
                                     entry.model,
-                                    entry.status === "success" ? "成功" : entry.status === "error" ? "失败" : "未测完",
+                                    entry.status === "success"
+                                      ? "成功"
+                                      : entry.status === "error"
+                                        ? "失败"
+                                        : entry.status === "pending"
+                                          ? "测试中"
+                                          : "未测",
                                     entry.elapsedMs ? formatDurationLabel(entry.elapsedMs) : "-",
                                     entry.detail || ""
                                   ].join("\t")
@@ -5897,9 +5921,16 @@ export default function Home() {
                     <span className="rounded-full bg-red-50 px-3 py-1 text-xs font-semibold text-red-600">
                       失败 {failCount}
                     </span>
-                    <span className="rounded-full bg-amber-50 px-3 py-1 text-xs font-semibold text-amber-700">
-                      未完成 {pendingCount}
-                    </span>
+                    {pendingCount > 0 ? (
+                      <span className="rounded-full bg-amber-50 px-3 py-1 text-xs font-semibold text-amber-700">
+                        测试中 {pendingCount}
+                      </span>
+                    ) : null}
+                    {idleCount > 0 ? (
+                      <span className="rounded-full bg-zinc-100 px-3 py-1 text-xs font-semibold text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300">
+                        未测 {idleCount}
+                      </span>
+                    ) : null}
                     <span className="rounded-full bg-zinc-100 px-3 py-1 text-xs font-medium text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300">
                       共 {entries.length} 个 · 间隔 {getConfigCycleIntervalSec(modelTestDialogItem)} 秒
                     </span>
@@ -5968,7 +5999,15 @@ export default function Home() {
                               className={`inline-flex w-fit items-center gap-1 rounded-full px-2 py-0.5 font-semibold ${statusPillClass(entry.status)}`}
                             >
                               <StatusIcon status={entry.status} />
-                              <span>{entry.status === "success" ? "成功" : entry.status === "error" ? "失败" : "未测完"}</span>
+                              <span>
+                                {entry.status === "success"
+                                  ? "成功"
+                                  : entry.status === "error"
+                                    ? "失败"
+                                    : entry.status === "pending"
+                                      ? "测试中"
+                                      : "未测"}
+                              </span>
                             </span>
                             <span className="text-zinc-500">
                               {entry.elapsedMs ? formatDurationLabel(entry.elapsedMs) : "-"}
