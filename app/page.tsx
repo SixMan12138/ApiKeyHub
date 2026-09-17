@@ -2613,6 +2613,15 @@ export default function Home() {
               >
                 <StatusIcon status={result.status} />
               </span>
+              {isCollapsed && getConfigTestMode(item) === "chain" && result.testedAt ? (
+                <span
+                  className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700 dark:border-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300"
+                  title={`最近测试：${toDateTimeLabel(result.testedAt)}`}
+                >
+                  <FaRegClock className="shrink-0" aria-hidden />
+                  <span className="whitespace-nowrap">{toDateTimeLabel(result.testedAt)}</span>
+                </span>
+              ) : null}
               </div>
               {isCollapsed ? (
                 <>
@@ -2742,21 +2751,7 @@ export default function Home() {
               ) : null}
             </div>
 
-            {isCollapsed ? (
-              getConfigTestMode(item) === "chain" ? (
-                result.testedAt ? (
-                  <div className="mt-1 flex min-w-0 items-center gap-2">
-                    {/* 循环测试的卡片：只保留最近测试时间，选中模型/命中模型/结果详情不再占地方 */}
-                    <span
-                      className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-zinc-200 bg-zinc-50 px-2 py-1 text-xs text-zinc-600 dark:border-zinc-700 dark:bg-zinc-800/60 dark:text-zinc-300"
-                      title={`最近测试：${toDateTimeLabel(result.testedAt)}`}
-                    >
-                      <FaRegClock className="shrink-0 text-zinc-400 dark:text-zinc-500" aria-hidden />
-                      <span className="whitespace-nowrap">{toDateTimeLabel(result.testedAt)}</span>
-                    </span>
-                  </div>
-                ) : null
-              ) : (
+            {isCollapsed && getConfigTestMode(item) !== "chain" ? (
               <div className="mt-1 flex min-w-0 items-center gap-2">
                 {/* 仅测评中的卡片：模型 + 命中 + 结果（不放测试时间） */}
                 <span
@@ -2785,7 +2780,6 @@ export default function Home() {
                   </span>
                 ) : null}
               </div>
-              )
             ) : (
               <>
                 <div className="mt-2 grid gap-2">
