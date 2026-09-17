@@ -13,6 +13,8 @@ export type OpenAIProxyTestRequest = OpenAIProxyBaseRequest & {
   // 循环测试逐模型扫描：只测这一个模型，跳过瞬时错误整体重试并收紧总时限，
   // 避免个别慢模型把整轮扫描拖垮、也避免同一站点被连续打满 RPM
   sweep?: boolean;
+  // 自定义测试提问词：留空回落服务端默认的「你是谁」，避免发空请求
+  prompt?: string;
 };
 
 export type OpenAIProxyTestResponse = {

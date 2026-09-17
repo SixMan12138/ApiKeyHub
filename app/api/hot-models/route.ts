@@ -10,6 +10,8 @@ type HotModelDocument = {
   // 关闭时循环测试仍走全量扫描，列表只是先存着
   enabled: boolean;
   models: string[];
+  // 模型测试的自定义提问词，空串 = 用默认的「你是谁」
+  testPrompt?: string;
 };
 
 const DATA_DIRECTORY = join(process.cwd(), "data");
@@ -39,7 +41,12 @@ function normalizeDocument(value: unknown): HotModelDocument {
     if (deduped.length >= MAX_HOT_MODELS) break;
   }
 
-  return { version: 1, enabled: record.enabled === true, models: deduped };
+  return {
+    version: 1,
+    enabled: record.enabled === true,
+    models: deduped,
+    testPrompt: typeof record.testPrompt === "string" ? record.testPrompt.trim().slice(0, 200) : ""
+  };
 }
 
 async function readHotModelDocument(): Promise<HotModelDocument> {

@@ -10,6 +10,7 @@ import {
   FaCheckCircle,
   FaChevronDown,
   FaChevronUp,
+  FaCommentDots,
   FaCompressArrowsAlt,
   FaCopy,
   FaDesktop,
@@ -1980,6 +1981,10 @@ export default function Home() {
   // 热点模型：已保存的列表与开关（服务端 data/hot-models.json）
   const [hotModels, setHotModels] = useState<string[]>([]);
   const [hotModelsEnabled, setHotModelsEnabled] = useState(false);
+  // 模型测试提问词：自定义后单测与循环测试都发这句；存服务端 hot-models.json，换浏览器不丢
+  const [testPrompt, setTestPrompt] = useState("");
+  const [testPromptDialogOpen, setTestPromptDialogOpen] = useState(false);
+  const [testPromptDraft, setTestPromptDraft] = useState("");
   // 弹窗里改的是草稿，点「保存」才落盘，避免误点直接改变测试行为
   const [hotModelDialogOpen, setHotModelDialogOpen] = useState(false);
   const [hotModelDraft, setHotModelDraft] = useState<string[]>([]);
@@ -2137,6 +2142,7 @@ export default function Home() {
           : [];
         setHotModels(uniqueStrings(models).slice(0, MAX_HOT_MODELS));
         setHotModelsEnabled(payload.enabled === true);
+        setTestPrompt(typeof payload.testPrompt === "string" ? payload.testPrompt : "");
       } catch {
         // 忽略：热点模型是增强项，拿不到就按关闭处理
       }
@@ -2252,7 +2258,7 @@ export default function Home() {
       const response = await fetch("/api/hot-models", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ version: 1, enabled: hotModelDraftEnabled, models })
+        body: JSON.stringify({ version: 1, enabled: hotModelDraftEnabled, models, testPrompt })
       });
       if (!response.ok) throw new Error("save failed");
 
@@ -2268,6 +2274,33 @@ export default function Home() {
       );
     } catch {
       setNotice("保存热点模型失败，请检查服务状态", "error");
+    } finally {
+      setIsSavingHotModels(false);
+    }
+  }
+
+  function openTestPromptDialog() {
+    setTestPromptDraft(testPrompt);
+    setTestPromptDialogOpen(true);
+  }
+
+  // 提问词与热点模型共用同一份文档（hot-models.json），保存时带上当前列表，避免互相覆盖
+  async function saveTestPrompt() {
+    const prompt = testPromptDraft.trim().slice(0, 200);
+    setIsSavingHotModels(true);
+    try {
+      const response = await fetch("/api/hot-models", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ version: 1, enabled: hotModelsEnabled, models: hotModels, testPrompt: prompt })
+      });
+      if (!response.ok) throw new Error("save failed");
+
+      setTestPrompt(prompt);
+      setTestPromptDialogOpen(false);
+      setNotice(prompt ? "已保存测试提问词，之后所有模型测试都用这句" : "已恢复默认测试提问词「你是谁」");
+    } catch {
+      setNotice("保存测试提问词失败，请检查服务状态", "error");
     } finally {
       setIsSavingHotModels(false);
     }
@@ -4095,7 +4128,9 @@ export default function Home() {
           // 避免写死 gpt-4o-mini 而渠道分组实际不提供导致误判失败
           model: item.model.trim() || item.probe?.recommendedModel?.trim() || "",
           apiFormat: item.apiFormat || "auto",
-          fallbackModels: []
+          fallbackModels: [],
+          // 自定义测试词；留空服务端回落默认的「你是谁」
+          prompt: testPrompt
         },
         // 服务端含瞬时重试和候选链，预算放宽到 8 分钟
         480000
@@ -4235,7 +4270,8 @@ export default function Home() {
             apiFormat: item.apiFormat || "auto",
             // 扫描模式：服务端只测这一个模型，不走候选链也不做整体重试
             fallbackModels: [],
-            sweep: true
+            sweep: true,
+            prompt: testPrompt
           },
           CYCLE_MODEL_REQUEST_TIMEOUT_MS
         );
@@ -5330,6 +5366,22 @@ export default function Home() {
                 );
               })()}
 
+              <button
+                type="button"
+                className={`${topBtnGhost} ${
+                  testPrompt ? "border-emerald-400 text-emerald-700 dark:border-emerald-600 dark:text-emerald-400" : ""
+                }`}
+                onClick={openTestPromptDialog}
+                title={
+                  testPrompt
+                    ? `当前测试提问词：${testPrompt}，点击修改`
+                    : "设置模型测试的提问词，留空用默认的「你是谁」"
+                }
+              >
+                <FaCommentDots aria-hidden />
+                <span>测试词</span>
+              </button>
+
               <div
                 className="relative ml-auto flex min-w-0 w-full max-w-md items-center gap-2 sm:w-auto sm:min-w-[16rem]"
                 ref={searchBoxRef}
@@ -5807,6 +5859,53 @@ export default function Home() {
                 <FaLink aria-hidden />
                 <span>立即唤起</span>
               </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {testPromptDialogOpen ? (
+        <div
+          className="fixed inset-0 z-30 flex items-center justify-center bg-zinc-950/35 px-4"
+          onClick={() => setTestPromptDialogOpen(false)}
+        >
+          <div
+            className="w-full max-w-xl rounded-[30px] border border-zinc-200 bg-white p-4 shadow-2xl sm:p-5 dark:border-zinc-700 dark:bg-zinc-900"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p className="inline-flex items-center gap-2 text-base font-semibold text-zinc-900 dark:text-zinc-100">
+                  <FaCommentDots aria-hidden />
+                  <span>模型测试提问词</span>
+                  <HelpHint text="所有模型测试（单测、循环测试逐模型）都把这句话发给上游。留空恢复默认；建议保持短句，太长会白烧 token。" />
+                </p>
+                <p className="mt-1 text-sm text-zinc-500">
+                  默认：你是谁？请用一句简短中文回复，不要使用 Markdown。
+                </p>
+              </div>
+              <button type="button" className={smallBtn} onClick={() => setTestPromptDialogOpen(false)}>
+                <FaTimesCircle aria-hidden />
+                <span>关闭</span>
+              </button>
+            </div>
+            <textarea
+              className="mt-3 h-24 w-full rounded-xl border border-zinc-300 bg-white px-3 py-2.5 text-sm text-zinc-900 outline-none transition hover:border-zinc-400 focus:border-zinc-400 focus:ring-4 focus:ring-emerald-100 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
+              value={testPromptDraft}
+              onChange={(e) => setTestPromptDraft(e.target.value)}
+              placeholder="留空使用默认提问词"
+              maxLength={200}
+            />
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <button type="button" className={btnPrimary} onClick={() => void saveTestPrompt()} disabled={isSavingHotModels}>
+                <FaSave aria-hidden />
+                <span>{isSavingHotModels ? "保存中..." : "保存"}</span>
+              </button>
+              <button type="button" className={btnGhost} onClick={() => setTestPromptDraft("")}>
+                <FaMagic aria-hidden />
+                <span>恢复默认</span>
+              </button>
+              <span className="text-xs text-zinc-400">{testPromptDraft.length}/200</span>
             </div>
           </div>
         </div>

@@ -24,6 +24,7 @@ export async function POST(request: NextRequest) {
         apiFormat: body.apiFormat === "chat" || body.apiFormat === "responses" || body.apiFormat === "messages" ? body.apiFormat : "auto",
         fallbackModels,
         sweep: body.sweep === true,
+        prompt: typeof body.prompt === "string" ? body.prompt : "",
       }),
     );
   } catch {

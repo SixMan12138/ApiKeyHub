@@ -18,6 +18,8 @@ const proxyUrl = process.env.HTTPS_PROXY || process.env.https_proxy || process.e
 const proxyDispatcher = proxyUrl ? new ProxyAgent(proxyUrl) : undefined;
 
 const FAIL_TEXT = "主人，我不行了";
+// 默认测试提问词：短问句 + 限定回复格式，token 开销最小，还能顺带暴露只会喵喵叫的套壳模型
+export const DEFAULT_TEST_PROMPT = "你是谁？请用一句简短中文回复，不要使用 Markdown。";
 const PASS_TEXT = "主人，快鞭策我吧";
 const MODEL_CANDIDATES = ["gpt-4.1-mini", "gpt-4o-mini", "gpt-4.1", "gpt-4o", "gpt-5-mini", "gpt-5"];
 // 推理模型（如 glm-5.x）常把小 token 预算全部耗在思考上，导致 content 为空被误判失败
@@ -909,7 +911,8 @@ export async function runOpenAITest(input: OpenAIProxyTestRequest): Promise<Open
   const baseUrl = toOpenAIBaseUrl(input.baseUrl);
   const apiKey = cleanKey(input.apiKey);
   const testedAt = new Date().toISOString();
-  const prompt = "你是谁？请用一句简短中文回复，不要使用 Markdown。";
+  // 顶部「测试词」按钮可自定义；留空回落默认，避免空 prompt 发出无效请求
+  const prompt = input.prompt?.trim() || DEFAULT_TEST_PROMPT;
   // 循环测试扫描模式：单模型、少请求、不整体重试
   const sweepMode = input.sweep === true;
   const startedAt = performance.now();
