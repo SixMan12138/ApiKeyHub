@@ -60,7 +60,7 @@
 - 支持读取当前 Key 在该渠道下能看到的模型列表
 - 识别完成后会给出推荐模型，并支持复制模型列表；推荐时会自动跳过画图、向量等非对话模型
 - 支持在识别结果里直接切换当前模型
-- 模型列表与配置卡片支持按分类筛选：GPT / Claude / GLM / DeepSeek / Gemini / Grok / Mimo / Moonshot (Kimi) / MiniMax / Qwen 等
+- 模型列表与配置卡片支持按分类筛选：GPT / Claude / GLM / DeepSeek / Gemini / Grok / Mimo / Moonshot (Kimi) / MiniMax / Qwen 等。配置列表的筛选按「卡片覆盖的模型」判断：配置模型、识别到的站点模型列表、上次命中的模型、循环测试测过的模型，只要其中出现该厂模型，点该分类就能看到这张卡
 
 ### ⚡ 性能评测
 

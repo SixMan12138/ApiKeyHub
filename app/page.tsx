@@ -261,6 +261,19 @@ function inferModelCategory(model: string): ModelCategory {
   const hit = MODEL_CATEGORY_RULES.find((r) => r.patterns.some((p) => p.test(m)));
   return hit ? hit.category : "other";
 }
+// 列表分类筛选看的是「卡片覆盖的模型」而不只是配置的那一个名字：
+// 黑白公益-def 配置模型是 deepseek 系，但站点模型里有 qwen3.8，
+// 点 Qwen 也必须能看到这张卡，否则筛选结果会误导成「这个站点没有该厂模型」。
+// 覆盖范围：配置模型 + 识别到的站点模型列表 + 上次命中的模型 + 循环测试测过的模型
+function configCoversCategory(item: KeyConfig, category: ModelCategory): boolean {
+  if (inferModelCategory(item.model) === category) return true;
+  if (item.lastTest?.model && inferModelCategory(item.lastTest.model) === category) return true;
+  const supported = item.probe?.supportedModels;
+  if (supported && supported.some((model) => inferModelCategory(model) === category)) return true;
+  const tested = item.modelTests;
+  if (tested && tested.some((entry) => inferModelCategory(entry.model) === category)) return true;
+  return false;
+}
 
 // ---------- 热点模型：循环测试只测这份列表命中的模型，避免整表扫描白烧 token ----------
 const MAX_HOT_MODELS = 200;
@@ -2364,9 +2377,9 @@ export default function Home() {
   const [activeList, setActiveList] = useState<"all" | "failed" | "disabled">("all");
   const baseActiveConfigs =
     activeList === "failed" ? failedConfigs : activeList === "disabled" ? disabledConfigs : visibleConfigs;
-  // 按模型分类过滤（与失败/配置列表切换叠加）
+  // 按模型分类过滤（与失败/配置列表切换叠加）：只要卡片上出现过该厂模型就算命中
   const activeConfigs = baseActiveConfigs.filter(
-    (item) => categoryFilter === "all" || inferModelCategory(item.model) === categoryFilter
+    (item) => categoryFilter === "all" || configCoversCategory(item, categoryFilter)
   );
   const activeCount = activeConfigs.length;
   const activeCollapsedCount = activeConfigs.filter((item) => isConfigCollapsed(item.id)).length;
