@@ -28,6 +28,7 @@ import {
   FaPaste,
   FaPlus,
   FaQuestionCircle,
+  FaRegClock,
   FaSave,
   FaSearch,
   FaSpinner,
@@ -2738,6 +2739,15 @@ export default function Home() {
                   <FaTag className="shrink-0 text-zinc-400 dark:text-zinc-500" aria-hidden />
                   <span className="truncate">{item.model || "（未设置）"}</span>
                 </span>
+                {result.testedAt ? (
+                  <span
+                    className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-zinc-200 bg-zinc-50 px-2 py-1 text-xs text-zinc-600 dark:border-zinc-700 dark:bg-zinc-800/60 dark:text-zinc-300"
+                    title={`最近测试：${toDateTimeLabel(result.testedAt)}`}
+                  >
+                    <FaRegClock className="shrink-0 text-zinc-400 dark:text-zinc-500" aria-hidden />
+                    <span className="whitespace-nowrap">{toDateTimeLabel(result.testedAt)}</span>
+                  </span>
+                ) : null}
                 {hitModel ? (
                   <span
                     className="inline-flex min-w-0 max-w-[26vw] shrink items-center gap-1 truncate rounded-lg border border-emerald-200 bg-emerald-50 px-2 py-1 text-xs font-medium text-emerald-700 dark:border-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300"
@@ -4718,7 +4728,9 @@ export default function Home() {
 
   function openModelTestDialog(item: KeyConfig) {
     setModelTestSearch("");
-    setModelTestFilter("all");
+    // 默认只看成功的模型；要看全部/失败/未测时用弹窗顶部的快速筛选一键切换
+    const entries = modelTestMap[item.id] || item.modelTests || [];
+    setModelTestFilter(entries.some((entry) => entry.status === "success") ? "success" : "all");
     setModelTestDialogId(item.id);
   }
 
