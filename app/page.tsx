@@ -2751,7 +2751,8 @@ export default function Home() {
               ) : null}
             </div>
 
-            {isCollapsed && getConfigTestMode(item) !== "chain" ? (
+            {isCollapsed ? (
+              getConfigTestMode(item) !== "chain" ? (
               <div className="mt-1 flex min-w-0 items-center gap-2">
                 {/* 仅测评中的卡片：模型 + 命中 + 结果（不放测试时间） */}
                 <span
@@ -2780,6 +2781,7 @@ export default function Home() {
                   </span>
                 ) : null}
               </div>
+              ) : null
             ) : (
               <>
                 <div className="mt-2 grid gap-2">
