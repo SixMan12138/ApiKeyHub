@@ -261,17 +261,17 @@ function inferModelCategory(model: string): ModelCategory {
   const hit = MODEL_CATEGORY_RULES.find((r) => r.patterns.some((p) => p.test(m)));
   return hit ? hit.category : "other";
 }
-// 列表分类筛选看的是「卡片覆盖的模型」而不只是配置的那一个名字：
-// 黑白公益-def 配置模型是 deepseek 系，但站点模型里有 qwen3.8，
-// 点 Qwen 也必须能看到这张卡，否则筛选结果会误导成「这个站点没有该厂模型」。
-// 覆盖范围：配置模型 + 识别到的站点模型列表 + 上次命中的模型 + 循环测试测过的模型
-function configCoversCategory(item: KeyConfig, category: ModelCategory): boolean {
-  if (inferModelCategory(item.model) === category) return true;
-  if (item.lastTest?.model && inferModelCategory(item.lastTest.model) === category) return true;
-  const supported = item.probe?.supportedModels;
-  if (supported && supported.some((model) => inferModelCategory(model) === category)) return true;
-  const tested = item.modelTests;
-  if (tested && tested.some((entry) => inferModelCategory(entry.model) === category)) return true;
+// 列表分类筛选按「测试列表里测成功过的模型」判断：只配置了名字但没测通的不算，
+// 这样点某厂分类，出来的就是该厂模型当前真实测通的卡片，不会被未验证的名字误导。
+// 成功来源：循环测试明细里的 success 条目（优先用运行时结果），
+// 以及仅测选中时上次测试成功的命中模型（旧记录没存命中模型时回落到配置模型）
+function configCoversCategory(item: KeyConfig, category: ModelCategory, runtimeTests?: ModelTestItem[]): boolean {
+  const tested = runtimeTests && runtimeTests.length > 0 ? runtimeTests : item.modelTests;
+  if (tested && tested.some((entry) => entry.status === "success" && inferModelCategory(entry.model) === category)) {
+    return true;
+  }
+  const successModel = item.lastTest?.model || item.model;
+  if (item.lastTest?.status === "success" && inferModelCategory(successModel) === category) return true;
   return false;
 }
 
@@ -2377,9 +2377,9 @@ export default function Home() {
   const [activeList, setActiveList] = useState<"all" | "failed" | "disabled">("all");
   const baseActiveConfigs =
     activeList === "failed" ? failedConfigs : activeList === "disabled" ? disabledConfigs : visibleConfigs;
-  // 按模型分类过滤（与失败/配置列表切换叠加）：只要卡片上出现过该厂模型就算命中
+  // 按模型分类过滤（与失败/配置列表切换叠加）：按测试列表里测成功的模型判断，「全部」不受影响
   const activeConfigs = baseActiveConfigs.filter(
-    (item) => categoryFilter === "all" || configCoversCategory(item, categoryFilter)
+    (item) => categoryFilter === "all" || configCoversCategory(item, categoryFilter, modelTestMap[item.id])
   );
   const activeCount = activeConfigs.length;
   const activeCollapsedCount = activeConfigs.filter((item) => isConfigCollapsed(item.id)).length;
@@ -2743,8 +2743,22 @@ export default function Home() {
             </div>
 
             {isCollapsed ? (
+              getConfigTestMode(item) === "chain" ? (
+                result.testedAt ? (
+                  <div className="mt-1 flex min-w-0 items-center gap-2">
+                    {/* 循环测试的卡片：只保留最近测试时间，选中模型/命中模型/结果详情不再占地方 */}
+                    <span
+                      className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-zinc-200 bg-zinc-50 px-2 py-1 text-xs text-zinc-600 dark:border-zinc-700 dark:bg-zinc-800/60 dark:text-zinc-300"
+                      title={`最近测试：${toDateTimeLabel(result.testedAt)}`}
+                    >
+                      <FaRegClock className="shrink-0 text-zinc-400 dark:text-zinc-500" aria-hidden />
+                      <span className="whitespace-nowrap">{toDateTimeLabel(result.testedAt)}</span>
+                    </span>
+                  </div>
+                ) : null
+              ) : (
               <div className="mt-1 flex min-w-0 items-center gap-2">
-                {/* 模型 + 返回内容 + 操作按钮（单行） */}
+                {/* 仅测评中的卡片：模型 + 命中 + 结果（不放测试时间） */}
                 <span
                   className="inline-flex min-w-0 max-w-[42vw] shrink items-center gap-1 truncate rounded-lg border border-zinc-200 bg-zinc-50 px-2 py-1 text-xs font-medium text-zinc-700 dark:border-zinc-700 dark:bg-zinc-800/60 dark:text-zinc-200"
                   title={item.model || "（未设置）"}
@@ -2752,15 +2766,6 @@ export default function Home() {
                   <FaTag className="shrink-0 text-zinc-400 dark:text-zinc-500" aria-hidden />
                   <span className="truncate">{item.model || "（未设置）"}</span>
                 </span>
-                {result.testedAt ? (
-                  <span
-                    className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-zinc-200 bg-zinc-50 px-2 py-1 text-xs text-zinc-600 dark:border-zinc-700 dark:bg-zinc-800/60 dark:text-zinc-300"
-                    title={`最近测试：${toDateTimeLabel(result.testedAt)}`}
-                  >
-                    <FaRegClock className="shrink-0 text-zinc-400 dark:text-zinc-500" aria-hidden />
-                    <span className="whitespace-nowrap">{toDateTimeLabel(result.testedAt)}</span>
-                  </span>
-                ) : null}
                 {hitModel ? (
                   <span
                     className="inline-flex min-w-0 max-w-[26vw] shrink items-center gap-1 truncate rounded-lg border border-emerald-200 bg-emerald-50 px-2 py-1 text-xs font-medium text-emerald-700 dark:border-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300"
@@ -2780,6 +2785,7 @@ export default function Home() {
                   </span>
                 ) : null}
               </div>
+              )
             ) : (
               <>
                 <div className="mt-2 grid gap-2">
