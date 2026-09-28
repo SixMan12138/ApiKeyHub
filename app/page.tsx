@@ -1715,8 +1715,19 @@ function defaultProbeResult(): ProbeResult {
   return { status: "idle", supportedModels: [] };
 }
 
-async function fetchJsonWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<unknown> {
+async function fetchJsonWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+  externalSignal?: AbortSignal
+): Promise<unknown> {
   const controller = new AbortController();
+  const abortFromExternalSignal = () => controller.abort();
+  if (externalSignal?.aborted) {
+    controller.abort();
+  } else {
+    externalSignal?.addEventListener("abort", abortFromExternalSignal, { once: true });
+  }
   const timer = window.setTimeout(() => controller.abort(), timeoutMs);
 
   try {
@@ -1739,10 +1750,16 @@ async function fetchJsonWithTimeout(url: string, init: RequestInit, timeoutMs: n
     return payload;
   } finally {
     window.clearTimeout(timer);
+    externalSignal?.removeEventListener("abort", abortFromExternalSignal);
   }
 }
 
-async function postJsonWithTimeout<TResponse>(url: string, body: unknown, timeoutMs: number): Promise<TResponse> {
+async function postJsonWithTimeout<TResponse>(
+  url: string,
+  body: unknown,
+  timeoutMs: number,
+  externalSignal?: AbortSignal
+): Promise<TResponse> {
   return (await fetchJsonWithTimeout(
     url,
     {
@@ -1752,7 +1769,8 @@ async function postJsonWithTimeout<TResponse>(url: string, body: unknown, timeou
       },
       body: JSON.stringify(body)
     },
-    timeoutMs
+    timeoutMs,
+    externalSignal
   )) as TResponse;
 }
 
@@ -1996,6 +2014,8 @@ export default function Home() {
   const [hotModelCustom, setHotModelCustom] = useState("");
   const [isSavingHotModels, setIsSavingHotModels] = useState(false);
   const cycleCancelRef = useRef<Record<string, boolean>>({});
+  // 立即暂停：每轮循环测试的 AbortController，点停止时立刻中断正在飞行的请求
+  const cycleAbortRef = useRef<Record<string, AbortController>>({});
   const cycleStatsRef = useRef<Record<string, { ok: number; total: number }>>({});
   const [notice, setNoticeState] = useState<NoticeState | null>(null);
   const [testingAll, setTestingAll] = useState(false);
@@ -2684,7 +2704,7 @@ export default function Home() {
                       type="button"
                       className={`${smallBtn} border-red-200 text-red-600 dark:border-red-900/60 dark:text-red-400`}
                       onClick={() => stopCycleTest(item.id)}
-                      title="停止循环测试（当前模型测完即停）"
+                      title="停止循环测试（立即停止）"
                       aria-label="停止循环测试"
                     >
                       <FaStopCircle aria-hidden />
@@ -3024,7 +3044,7 @@ export default function Home() {
                             type="button"
                             className={`${smallBtn} border-red-200 text-red-600 dark:border-red-900/60 dark:text-red-400`}
                             onClick={() => stopCycleTest(item.id)}
-                            title="停止循环测试（当前模型测完即停）"
+                            title="停止循环测试（立即停止）"
                             aria-label="停止循环测试"
                           >
                             <FaStopCircle aria-hidden />
@@ -3899,6 +3919,7 @@ export default function Home() {
       setModelTestDialogId(null);
     }
     cycleCancelRef.current[id] = true;
+    cycleAbortRef.current[id]?.abort();
     setModelTestMap((prev) => {
       const next = { ...prev };
       delete next[id];
@@ -3932,6 +3953,9 @@ export default function Home() {
     setModelTestMap({});
     Object.keys(cycleCancelRef.current).forEach((key) => {
       cycleCancelRef.current[key] = true;
+    });
+    Object.keys(cycleAbortRef.current).forEach((key) => {
+      cycleAbortRef.current[key]?.abort();
     });
     setNotice("已删除全部配置");
   }
@@ -4075,6 +4099,11 @@ export default function Home() {
     setLoadingMap((prev) => ({ ...prev, [item.id]: true }));
     setResultMap((prev) => ({ ...prev, [item.id]: { status: "pending", message: "测试中..." } }));
 
+    // 立即暂停：整轮测试挂在一个可中止的控制器上，点停止时识别与逐模型请求一起中断
+    delete cycleCancelRef.current[item.id];
+    const cycleAbortController = new AbortController();
+    cycleAbortRef.current[item.id] = cycleAbortController;
+
     const baseUrl = toOpenAIBaseUrl(item.baseUrl);
     const apiKey = cleanKey(item.apiKey);
 
@@ -4109,10 +4138,15 @@ export default function Home() {
             ...prev,
             [item.id]: { status: "pending", message: "循环测试前先刷新模型列表..." }
           }));
-          const probedModels = await runModelProbe(item);
+          const probedModels = await runModelProbe(item, cycleAbortController.signal);
           if (probedModels.length > 0) {
             cycleModels = collectCycleModels(item, probedModels);
           }
+        }
+        // 暂停发生在识别阶段：立即退出，不再进入循环测试
+        if (cycleCancelRef.current[item.id]) {
+          setResultMap((prev) => ({ ...prev, [item.id]: item.lastTest || defaultTestResult() }));
+          return false;
         }
         if (cycleModels.length > 0) {
           return await runCycleTest(item, cycleModels, baseUrl, apiKey);
@@ -4240,7 +4274,9 @@ export default function Home() {
   ): Promise<boolean> {
     const intervalMs = getConfigCycleIntervalSec(item) * 1000;
     const roundStartedAt = Date.now();
-    delete cycleCancelRef.current[item.id];
+    // 控制器由 runTest 建好；这里不清暂停标志，识别阶段点的停止必须被尊重
+    const cycleAbortController = cycleAbortRef.current[item.id] || new AbortController();
+    cycleAbortRef.current[item.id] = cycleAbortController;
     setModelTestItems(
       item.id,
       models.map((model) => ({ model, status: "pending" as TestStatus }))
@@ -4273,7 +4309,8 @@ export default function Home() {
             sweep: true,
             prompt: testPrompt
           },
-          CYCLE_MODEL_REQUEST_TIMEOUT_MS
+          CYCLE_MODEL_REQUEST_TIMEOUT_MS,
+          cycleAbortController.signal
         );
         entry = {
           model,
@@ -4284,6 +4321,11 @@ export default function Home() {
           testedAt: response.result.testedAt || new Date().toISOString()
         };
       } catch (error: unknown) {
+        if (cycleCancelRef.current[item.id]) {
+          // 立即暂停：当前模型不再等结果、也不记为失败，直接停下后续模型
+          patchModelTestItem(item.id, model, { status: "idle", detail: "已手动停止，本轮未测" });
+          break;
+        }
         entry = {
           model,
           status: "error",
@@ -4345,7 +4387,7 @@ export default function Home() {
   }
 
   // 返回本轮识别到的模型名列表（失败时为空数组），供循环测试直接拿去扫描
-  async function runModelProbe(item: KeyConfig): Promise<string[]> {
+  async function runModelProbe(item: KeyConfig, externalSignal?: AbortSignal): Promise<string[]> {
     setProbeMap((prev) => ({
       ...prev,
       [item.id]: {
@@ -4375,7 +4417,8 @@ export default function Home() {
           apiKey,
           currentModel: item.model
         },
-        20000
+        20000,
+        externalSignal
       );
       commitFinishedProbeResult(item.id, response.result);
       return response.result.supportedModels || [];
@@ -4791,8 +4834,10 @@ export default function Home() {
 
   function stopCycleTest(id: string) {
     cycleCancelRef.current[id] = true;
+    // 立即暂停：中止正在飞行的请求，不再等当前模型测完
+    cycleAbortRef.current[id]?.abort();
     const target = configs.find((item) => item.id === id);
-    setNotice(`已请求停止循环测试：${target?.name || ""}（当前模型测完即停）`);
+    setNotice(`已立即停止循环测试：${target?.name || ""}（正在测试的请求已中断）`);
   }
 
   function openBenchmarkDialog(item: KeyConfig) {
@@ -5982,7 +6027,7 @@ export default function Home() {
                           type="button"
                           className={btnGhost}
                           onClick={() => stopCycleTest(modelTestDialogItem.id)}
-                          title="停止循环测试（当前模型测完即停）"
+                          title="停止循环测试（立即停止）"
                         >
                           <FaStopCircle aria-hidden />
                           <span>停止</span>

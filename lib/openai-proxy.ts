@@ -282,9 +282,25 @@ function makeErrorDetail(error: unknown): string {
   return `${detail}；接口返回：${raw}`;
 }
 
-async function fetchWithTimeout(url: string, init: UndiciRequestInit, timeoutMs: number): Promise<UndiciResponse> {
+async function fetchWithTimeout(
+  url: string,
+  init: UndiciRequestInit,
+  timeoutMs: number,
+  externalSignal?: AbortSignal,
+): Promise<UndiciResponse> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  // 用户主动停止时立即中断在飞请求，并且不再走代理重试
+  let externalAborted = false;
+  const forwardExternalAbort = () => {
+    externalAborted = true;
+    controller.abort();
+  };
+  if (externalSignal?.aborted) {
+    forwardExternalAbort();
+  } else {
+    externalSignal?.addEventListener("abort", forwardExternalAbort, { once: true });
+  }
 
   try {
     try {
@@ -295,6 +311,9 @@ async function fetchWithTimeout(url: string, init: UndiciRequestInit, timeoutMs:
     } catch (error) {
       // Only transport failures reach here; successful non-2xx responses stay untouched.
       // A direct-request timeout also falls back instead of spending another long OS-level timeout.
+      if (externalAborted) {
+        throw error;
+      }
       if (!proxyDispatcher) {
         throw error;
       }
@@ -314,6 +333,7 @@ async function fetchWithTimeout(url: string, init: UndiciRequestInit, timeoutMs:
     }
   } finally {
     clearTimeout(timer);
+    externalSignal?.removeEventListener("abort", forwardExternalAbort);
   }
 }
 
@@ -348,6 +368,7 @@ async function requestModelText(
   prompt: string,
   maxTokens: number,
   timeoutMs: number = CHAT_HEADER_TIMEOUT_MS,
+  externalSignal?: AbortSignal,
 ): Promise<ModelTextResult> {
   const startedAt = performance.now();
 
@@ -367,6 +388,7 @@ async function requestModelText(
         }),
       },
       timeoutMs,
+      externalSignal,
     );
 
     let payload: unknown = null;
@@ -424,6 +446,7 @@ async function requestResponsesText(
   model: string,
   prompt: string,
   timeoutMs: number = CHAT_HEADER_TIMEOUT_MS,
+  externalSignal?: AbortSignal,
 ): Promise<ModelTextResult> {
   const startedAt = performance.now();
 
@@ -442,6 +465,7 @@ async function requestResponsesText(
         }),
       },
       timeoutMs,
+      externalSignal,
     );
 
     let payload: unknown = null;
@@ -493,6 +517,7 @@ async function requestMessagesText(
   model: string,
   prompt: string,
   timeoutMs: number = CHAT_HEADER_TIMEOUT_MS,
+  externalSignal?: AbortSignal,
 ): Promise<ModelTextResult> {
   const startedAt = performance.now();
 
@@ -513,6 +538,7 @@ async function requestMessagesText(
         }),
       },
       timeoutMs,
+      externalSignal,
     );
 
     let payload: unknown = null;
@@ -749,6 +775,7 @@ async function requestModelTextStream(
   prompt: string,
   maxTokens: number,
   timeoutMs: number = STREAM_HEADER_TIMEOUT_MS,
+  externalSignal?: AbortSignal,
 ): Promise<StreamTextResult> {
   const startedAt = performance.now();
 
@@ -769,6 +796,7 @@ async function requestModelTextStream(
         }),
       },
       timeoutMs,
+      externalSignal,
     );
 
     if (!response.ok) {
@@ -915,6 +943,8 @@ export async function runOpenAITest(input: OpenAIProxyTestRequest): Promise<Open
   const prompt = input.prompt?.trim() || DEFAULT_TEST_PROMPT;
   // 循环测试扫描模式：单模型、少请求、不整体重试
   const sweepMode = input.sweep === true;
+  // 客户端立即暂停时透传的信号：中断在飞请求，不再发起新的尝试
+  const externalSignal = input.signal;
   const startedAt = performance.now();
 
   if (!baseUrl || !apiKey) {
@@ -941,21 +971,25 @@ export async function runOpenAITest(input: OpenAIProxyTestRequest): Promise<Open
   ]).slice(0, MAX_MODEL_CANDIDATE_TRIES);
 
   async function runCandidateAttempts(model: string, budgetMs: number): Promise<SourcedModelTextResult[]> {
+    if (externalSignal?.aborted) {
+      // 已暂停：不再发起新请求
+      return [];
+    }
     const attempts: SourcedModelTextResult[] = [];
     const chatTimeoutMs = Math.min(CHAT_HEADER_TIMEOUT_MS, budgetMs);
     const streamTimeoutMs = Math.min(STREAM_HEADER_TIMEOUT_MS, budgetMs);
 
     if (apiFormat === "chat") {
-      const chatResponse = await requestModelText(baseUrl, apiKey, model, prompt, TEST_MAX_TOKENS, chatTimeoutMs);
+      const chatResponse = await requestModelText(baseUrl, apiKey, model, prompt, TEST_MAX_TOKENS, chatTimeoutMs, externalSignal);
       attempts.push({ ...chatResponse, source: "chat" });
     } else if (apiFormat === "responses") {
-      const responsesResponse = await requestResponsesText(baseUrl, apiKey, model, prompt, chatTimeoutMs);
+      const responsesResponse = await requestResponsesText(baseUrl, apiKey, model, prompt, chatTimeoutMs, externalSignal);
       attempts.push({ ...responsesResponse, source: "responses" });
     } else if (apiFormat === "messages") {
-      const messagesResponse = await requestMessagesText(baseUrl, apiKey, model, prompt, chatTimeoutMs);
+      const messagesResponse = await requestMessagesText(baseUrl, apiKey, model, prompt, chatTimeoutMs, externalSignal);
       attempts.push({ ...messagesResponse, source: "messages" });
     } else {
-      const streamResponse = await requestModelTextStream(baseUrl, apiKey, model, prompt, TEST_MAX_TOKENS, streamTimeoutMs);
+      const streamResponse = await requestModelTextStream(baseUrl, apiKey, model, prompt, TEST_MAX_TOKENS, streamTimeoutMs, externalSignal);
       attempts.push({ ...streamResponse, source: "stream" });
 
       // 扫描模式下流式已经出话就不再补测，控制单个站点的请求密度
@@ -963,8 +997,8 @@ export async function runOpenAITest(input: OpenAIProxyTestRequest): Promise<Open
         ? streamResponse.ok
         : streamResponse.ok && !isLowSignalResponseText(streamResponse.text);
 
-      if (!streamUsable) {
-        const chatResponse = await requestModelText(baseUrl, apiKey, model, prompt, TEST_MAX_TOKENS, chatTimeoutMs);
+      if (!streamUsable && !externalSignal?.aborted) {
+        const chatResponse = await requestModelText(baseUrl, apiKey, model, prompt, TEST_MAX_TOKENS, chatTimeoutMs, externalSignal);
         attempts.push({ ...chatResponse, source: "chat" });
 
         const shouldTryResponses =
@@ -973,8 +1007,8 @@ export async function runOpenAITest(input: OpenAIProxyTestRequest): Promise<Open
           shouldTryResponsesFallback(chatResponse.error || "") ||
           (!sweepMode && (!chatResponse.ok || isLowSignalResponseText(chatResponse.text)));
 
-        if (shouldTryResponses) {
-          const responsesResponse = await requestResponsesText(baseUrl, apiKey, model, prompt, chatTimeoutMs);
+        if (shouldTryResponses && !externalSignal?.aborted) {
+          const responsesResponse = await requestResponsesText(baseUrl, apiKey, model, prompt, chatTimeoutMs, externalSignal);
           attempts.push({ ...responsesResponse, source: "responses" });
         }
       }
@@ -1032,7 +1066,7 @@ export async function runOpenAITest(input: OpenAIProxyTestRequest): Promise<Open
 
   // 瞬时错误（超时/限流/网络抖动）不直接判死，延迟后整体再试一次；
   // 扫描模式把重试交给下一轮循环，单次请求不额外占用站点配额
-  if (!sweepMode && !evaluation.best && evaluation.sawTransientError && Date.now() < deadlineAt) {
+  if (!sweepMode && !externalSignal?.aborted && !evaluation.best && evaluation.sawTransientError && Date.now() < deadlineAt) {
     await delay(TRANSIENT_RETRY_DELAY_MS);
     evaluation = await evaluateCandidates();
   }

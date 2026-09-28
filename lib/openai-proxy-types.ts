@@ -15,6 +15,8 @@ export type OpenAIProxyTestRequest = OpenAIProxyBaseRequest & {
   sweep?: boolean;
   // 自定义测试提问词：留空回落服务端默认的「你是谁」，避免发空请求
   prompt?: string;
+  // 客户端断开（立即暂停/关闭页面）时透传的信号：中断在飞的上游请求，不再白烧 token
+  signal?: AbortSignal;
 };
 
 export type OpenAIProxyTestResponse = {

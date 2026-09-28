@@ -25,6 +25,8 @@ export async function POST(request: NextRequest) {
         fallbackModels,
         sweep: body.sweep === true,
         prompt: typeof body.prompt === "string" ? body.prompt : "",
+        // 客户端断开（点停止）时 Next 会中止该信号，透传给上游请求实现立即暂停
+        signal: request.signal,
       }),
     );
   } catch {
