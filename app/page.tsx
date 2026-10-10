@@ -10,6 +10,9 @@ import {
   FaCheckCircle,
   FaChevronDown,
   FaChevronUp,
+  FaCloud,
+  FaCloudDownloadAlt,
+  FaCloudUploadAlt,
   FaCommentDots,
   FaCompressArrowsAlt,
   FaCopy,
@@ -35,6 +38,7 @@ import {
   FaSpinner,
   FaStopCircle,
   FaSun,
+  FaSyncAlt,
   FaTag,
   FaTimesCircle,
   FaTrashAlt,
@@ -1792,6 +1796,45 @@ function inferCcSwitchHomepage(endpoint: string): string {
   }
 }
 
+/* --------------------------------------------------- WebDAV 备份与同步 */
+
+// 云端备份条目（由 /api/webdav 的 list 动作返回）
+type WebDavBackupItem = {
+  name: string;
+  path: string;
+  isDirectory: boolean;
+  lastModified: string;
+  size: number;
+};
+
+// 表单态：密码与口令不回显，留空表示沿用服务端已保存的值
+type WebDavSettingsForm = {
+  baseUrl: string;
+  username: string;
+  password: string;
+  remoteDir: string;
+  encrypt: boolean;
+  passphrase: string;
+  keep: string;
+};
+
+function formatWebDavTime(value: string): string {
+  if (!value) return "";
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+
+  return date.toLocaleString("zh-CN", { hour12: false });
+}
+
+function formatWebDavSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "-";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+
+  return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
+}
+
 function buildCcSwitchDeepLink(item: KeyConfig, app: CcSwitchApp): string {
   const params = new URLSearchParams();
   params.set("resource", "provider");
@@ -2020,6 +2063,24 @@ export default function Home() {
   const [notice, setNoticeState] = useState<NoticeState | null>(null);
   const [testingAll, setTestingAll] = useState(false);
   const [probingAll, setProbingAll] = useState(false);
+  // 左栏 Tab 切换：新增配置 vs WebDAV 备份与同步
+  const [leftTab, setLeftTab] = useState<"config" | "webdav">("config");
+  const [webdavSaving, setWebdavSaving] = useState(false);
+  const [webdavAction, setWebdavAction] = useState<"" | "test" | "backup" | "list" | "restore" | "delete">("");
+  const [webdavForm, setWebdavForm] = useState<WebDavSettingsForm>({
+    baseUrl: "https://dav.jianguoyun.com/dav",
+    username: "",
+    password: "",
+    remoteDir: "/ApiKeyHub",
+    encrypt: true,
+    passphrase: "",
+    keep: "10"
+  });
+  const [webdavHasPassword, setWebdavHasPassword] = useState(false);
+  const [webdavHasPassphrase, setWebdavHasPassphrase] = useState(false);
+  const [webdavLastBackupAt, setWebdavLastBackupAt] = useState("");
+  const [webdavHint, setWebdavHint] = useState("");
+  const [webdavItems, setWebdavItems] = useState<WebDavBackupItem[]>([]);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editForm, setEditForm] = useState<FormState>({ name: "", baseUrl: "", apiKey: "", model: "", apiFormat: "auto" });
   const [editingModelId, setEditingModelId] = useState<string | null>(null);
@@ -2053,6 +2114,145 @@ export default function Home() {
     }
 
     setNoticeState({ message, tone: tone || inferNoticeTone(message) });
+  }
+
+  /** 把服务端返回的 WebDAV 设置灌进表单；密码/口令一律留空，保持「不修改」语义 */
+  function applyWebdavSettings(settings: unknown) {
+    if (!isRecord(settings)) return;
+
+    setWebdavForm((prev) => ({
+      ...prev,
+      baseUrl: typeof settings.baseUrl === "string" && settings.baseUrl ? settings.baseUrl : prev.baseUrl,
+      username: typeof settings.username === "string" ? settings.username : prev.username,
+      password: "",
+      remoteDir: typeof settings.remoteDir === "string" && settings.remoteDir ? settings.remoteDir : prev.remoteDir,
+      encrypt: settings.encrypt !== false,
+      passphrase: "",
+      keep: typeof settings.keep === "number" ? String(settings.keep) : prev.keep
+    }));
+    setWebdavHasPassword(settings.hasPassword === true);
+    setWebdavHasPassphrase(settings.hasPassphrase === true);
+    setWebdavLastBackupAt(typeof settings.lastBackupAt === "string" ? settings.lastBackupAt : "");
+  }
+
+  // 挂载时读一次 WebDAV 配置：折叠标题能显示「上次备份」，提示文案由服务端下发
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadWebdavConfigOnce() {
+      try {
+        const payload = await fetchJsonWithTimeout("/api/webdav", { cache: "no-store" }, 20000);
+        if (cancelled || !isRecord(payload)) return;
+
+        applyWebdavSettings(payload.settings);
+        if (typeof payload.hint === "string" && payload.hint) setWebdavHint(payload.hint);
+      } catch {
+        // 忽略：WebDAV 是配置项，读取失败时按默认值展示
+      }
+    }
+
+    void loadWebdavConfigOnce();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /** 当前表单值作为「未保存的覆盖」发给服务端，空密码/空口令由服务端沿用已保存值 */
+  function webdavSettingsOverride() {
+    return {
+      baseUrl: webdavForm.baseUrl.trim(),
+      username: webdavForm.username.trim(),
+      password: webdavForm.password,
+      remoteDir: webdavForm.remoteDir.trim(),
+      encrypt: webdavForm.encrypt,
+      passphrase: webdavForm.passphrase,
+      keep: Number.parseInt(webdavForm.keep, 10) || 10
+    };
+  }
+
+  async function saveWebdavConfig() {
+    setWebdavSaving(true);
+
+    try {
+      const payload = await fetchJsonWithTimeout(
+        "/api/webdav",
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(webdavSettingsOverride())
+        },
+        20000
+      );
+
+      if (isRecord(payload)) applyWebdavSettings(payload.settings);
+      setNotice("WebDAV 配置已保存");
+    } catch (error: unknown) {
+      setNotice(getErrorMessage(error) || "保存 WebDAV 配置失败", "error");
+    } finally {
+      setWebdavSaving(false);
+    }
+  }
+
+  /** 恢复后用服务端最新数据刷新页面状态：配置列表 + 热点模型 + 测试提问词 */
+  async function reloadAfterWebdavRestore() {
+    try {
+      const configsPayload = await fetchJsonWithTimeout("/api/configs", { cache: "no-store" }, 20000);
+      if (isRecord(configsPayload) && Array.isArray(configsPayload.configs)) {
+        setConfigs(normalizeStoredConfigs(JSON.stringify(configsPayload.configs)));
+      }
+
+      const hotPayload = await fetchJsonWithTimeout("/api/hot-models", { cache: "no-store" }, 20000);
+      if (isRecord(hotPayload)) {
+        const models = Array.isArray(hotPayload.models)
+          ? hotPayload.models
+              .filter((item): item is string => typeof item === "string")
+              .map((item) => item.trim())
+              .filter(Boolean)
+          : [];
+        setHotModels(uniqueStrings(models).slice(0, MAX_HOT_MODELS));
+        setHotModelsEnabled(hotPayload.enabled === true);
+        setTestPrompt(typeof hotPayload.testPrompt === "string" ? hotPayload.testPrompt : "");
+      }
+    } catch {
+      setNotice("数据已恢复，但页面刷新失败，请手动刷新浏览器", "error");
+    }
+  }
+
+  async function runWebdavAction(action: "test" | "backup" | "list" | "restore" | "delete", file?: string) {
+    setWebdavAction(action);
+
+    try {
+      const payload = await postJsonWithTimeout<unknown>(
+        "/api/webdav",
+        { action, file, settings: webdavSettingsOverride() },
+        action === "test" || action === "list" ? 45000 : 120000
+      );
+      const record = isRecord(payload) ? payload : {};
+
+      if (action === "list") {
+        setWebdavItems(Array.isArray(record.items) ? (record.items as WebDavBackupItem[]) : []);
+      }
+
+      if (action === "backup") {
+        // 备份会改变云端列表与「上次备份」时间，清空旧列表避免展示过期条目
+        setWebdavItems([]);
+        applyWebdavSettings(record.settings);
+      }
+
+      if (action === "delete" && file) {
+        setWebdavItems((prev) => prev.filter((item) => item.name !== file));
+      }
+
+      if (action === "restore") {
+        await reloadAfterWebdavRestore();
+      }
+
+      setNotice(typeof record.message === "string" && record.message ? record.message : "WebDAV 操作完成");
+    } catch (error: unknown) {
+      setNotice(getErrorMessage(error) || "WebDAV 操作失败", "error");
+    } finally {
+      setWebdavAction("");
+    }
   }
 
   useEffect(() => {
@@ -5128,12 +5328,60 @@ export default function Home() {
       {/* 左栏表单宽度封顶，页面加宽的增量全部让给右侧配置列表 */}
       <div className="mx-auto grid w-full gap-3 lg:grid-cols-[minmax(22rem,26rem)_minmax(0,1fr)] xl:grid-cols-[minmax(24rem,28rem)_minmax(0,1fr)]">
         <section className="rounded-2xl border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900 p-3.5 shadow-sm sm:p-5">
-          <div className="mb-3 flex items-center justify-between gap-3">
-            <h2 className="text-base font-semibold text-zinc-900">新增配置</h2>
-            <span className="text-xs text-zinc-500">{configs.length} 条配置</span>
+          {/* 左栏 Tab 切换：新增配置 vs 备份与同步 */}
+          <div className="mb-4 flex flex-wrap items-center justify-between gap-2 border-b border-zinc-200 pb-3 dark:border-zinc-800">
+            <div
+              role="tablist"
+              aria-label="左侧功能视图"
+              className="inline-flex items-center rounded-full border border-zinc-200 bg-zinc-50 p-0.5 dark:border-zinc-700 dark:bg-zinc-800/60"
+            >
+              <button
+                type="button"
+                role="tab"
+                aria-selected={leftTab === "config"}
+                onClick={() => setLeftTab("config")}
+                className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-sm font-medium transition ${
+                  leftTab === "config"
+                    ? "bg-white text-zinc-900 shadow-sm dark:bg-zinc-900 dark:text-zinc-100"
+                    : "text-zinc-500 hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200"
+                }`}
+              >
+                <FaPlus aria-hidden className="text-xs" />
+                <span>新增配置</span>
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={leftTab === "webdav"}
+                onClick={() => setLeftTab("webdav")}
+                className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-sm font-medium transition ${
+                  leftTab === "webdav"
+                    ? "bg-white text-zinc-900 shadow-sm dark:bg-zinc-900 dark:text-zinc-100"
+                    : "text-zinc-500 hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200"
+                }`}
+              >
+                <FaCloud aria-hidden className="text-xs text-emerald-600 dark:text-emerald-400" />
+                <span>备份与同步</span>
+              </button>
+            </div>
+
+            {leftTab === "config" ? (
+              <span className="text-xs text-zinc-500">{configs.length} 条配置</span>
+            ) : (
+              <span className="flex items-center gap-1.5 text-[11px] text-zinc-500">
+                <span className="rounded-full bg-zinc-100 px-2 py-0.5 font-normal text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
+                  坚果云
+                </span>
+                {webdavLastBackupAt ? (
+                  <span className="hidden sm:inline">上次 {formatWebDavTime(webdavLastBackupAt)}</span>
+                ) : null}
+              </span>
+            )}
           </div>
 
-          <label className={labelClass}>粘贴内容（支持一次解析多个配置，也支持 cc-switch SQL 文本）</label>
+          {leftTab === "config" ? (
+            <div>
+              <label className={labelClass}>粘贴内容（支持一次解析多个配置，也支持 cc-switch SQL 文本）</label>
           <textarea
             className={inputClass}
             value={pasteRaw}
@@ -5218,7 +5466,171 @@ export default function Home() {
               </button>
             </div>
           </form>
-        </section>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {/* WebDAV 备份与同步（首发坚果云）：凭据存服务端，上传默认加密 */}
+          {webdavHint ? (
+            <p className="rounded-lg bg-zinc-50 p-2 text-[11px] leading-5 text-zinc-500 dark:bg-zinc-800/60 dark:text-zinc-400">
+              {webdavHint}
+            </p>
+          ) : null}
+
+          <div>
+            <label className={labelClass}>服务器地址</label>
+            <input
+              className={inputClass}
+              value={webdavForm.baseUrl}
+              onChange={(e) => setWebdavForm((prev) => ({ ...prev, baseUrl: e.target.value }))}
+              placeholder="https://dav.jianguoyun.com/dav"
+            />
+          </div>
+
+          <div>
+            <label className={labelClass}>账号（坚果云登录邮箱）</label>
+            <input
+              className={inputClass}
+              value={webdavForm.username}
+              onChange={(e) => setWebdavForm((prev) => ({ ...prev, username: e.target.value }))}
+              placeholder="you@example.com"
+              autoComplete="off"
+            />
+          </div>
+
+          <div>
+            <label className={labelClass}>应用密码</label>
+            <input
+              className={inputClass}
+              type="password"
+              value={webdavForm.password}
+              onChange={(e) => setWebdavForm((prev) => ({ ...prev, password: e.target.value }))}
+              placeholder={webdavHasPassword ? "已保存，留空表示不修改" : "坚果云生成的应用密码"}
+              autoComplete="new-password"
+            />
+          </div>
+
+          <div>
+            <label className={labelClass}>云端目录</label>
+            <input
+              className={inputClass}
+              value={webdavForm.remoteDir}
+              onChange={(e) => setWebdavForm((prev) => ({ ...prev, remoteDir: e.target.value }))}
+              placeholder="/ApiKeyHub"
+            />
+          </div>
+
+          <div className="grid grid-cols-2 gap-2">
+            <div>
+              <label className={labelClass}>保留备份份数</label>
+              <input
+                className={inputClass}
+                value={webdavForm.keep}
+                onChange={(e) => setWebdavForm((prev) => ({ ...prev, keep: e.target.value }))}
+                inputMode="numeric"
+                placeholder="10"
+              />
+            </div>
+            <label className="mt-2.5 flex items-start gap-2 rounded-xl border border-zinc-200 p-2 text-xs dark:border-zinc-700">
+              <input
+                type="checkbox"
+                className="mt-0.5"
+                checked={webdavForm.encrypt}
+                onChange={(e) => setWebdavForm((prev) => ({ ...prev, encrypt: e.target.checked }))}
+              />
+              <span>
+                <span className="font-semibold text-zinc-800 dark:text-zinc-100">加密上传</span>
+                <span className="block text-[11px] font-normal text-zinc-500">AES-256-GCM；口令丢失则云端备份无法恢复</span>
+              </span>
+            </label>
+          </div>
+
+          {webdavForm.encrypt ? (
+            <div>
+              <label className={labelClass}>加密口令</label>
+              <input
+                className={inputClass}
+                type="password"
+                value={webdavForm.passphrase}
+                onChange={(e) => setWebdavForm((prev) => ({ ...prev, passphrase: e.target.value }))}
+                placeholder={webdavHasPassphrase ? "已保存，留空表示不修改" : "自定义口令，恢复时需要"}
+                autoComplete="new-password"
+              />
+            </div>
+          ) : null}
+
+          <div className="mt-2 flex flex-wrap gap-2">
+            <button type="button" className={btnPrimary} onClick={saveWebdavConfig} disabled={webdavSaving}>
+              {webdavSaving ? <FaSpinner className="animate-spin" aria-hidden /> : <FaSave aria-hidden />}
+              <span>{webdavSaving ? "保存中" : "保存 WebDAV 配置"}</span>
+            </button>
+            <button type="button" className={btnGhost} onClick={() => void runWebdavAction("test")} disabled={webdavAction !== ""}>
+              {webdavAction === "test" ? <FaSpinner className="animate-spin" aria-hidden /> : <FaVial aria-hidden />}
+              <span>测试连接</span>
+            </button>
+            <button type="button" className={btnGhost} onClick={() => void runWebdavAction("backup")} disabled={webdavAction !== ""}>
+              {webdavAction === "backup" ? <FaSpinner className="animate-spin" aria-hidden /> : <FaCloudUploadAlt aria-hidden />}
+              <span>立即备份</span>
+            </button>
+            <button type="button" className={btnGhost} onClick={() => void runWebdavAction("list")} disabled={webdavAction !== ""}>
+              {webdavAction === "list" ? <FaSpinner className="animate-spin" aria-hidden /> : <FaSyncAlt aria-hidden />}
+              <span>刷新云端列表</span>
+            </button>
+          </div>
+
+          {webdavItems.length ? (
+            <ul className="mt-2 max-h-56 space-y-1.5 overflow-y-auto pr-1">
+              {webdavItems.map((item) => (
+                <li
+                  key={item.path}
+                  className="flex items-center justify-between gap-2 rounded-xl border border-zinc-200 px-2.5 py-1.5 text-xs dark:border-zinc-700"
+                >
+                  <span className="min-w-0">
+                    <span className="block truncate font-medium text-zinc-800 dark:text-zinc-100">{item.name}</span>
+                    <span className="block text-[11px] text-zinc-500">
+                      {formatWebDavTime(item.lastModified) || "时间未知"} · {formatWebDavSize(item.size)}
+                    </span>
+                  </span>
+                  <span className="flex shrink-0 items-center gap-1.5">
+                    <button
+                      type="button"
+                      className="inline-flex items-center gap-1 rounded-lg border border-zinc-300 px-2 py-1 font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-600 dark:text-zinc-200 dark:hover:bg-zinc-800"
+                      disabled={webdavAction !== ""}
+                      title="用云端这份备份覆盖本地配置"
+                      onClick={() => {
+                        if (!window.confirm(`从云端恢复「${item.name}」会覆盖本地配置与热点模型，确定继续？`)) return;
+                        void runWebdavAction("restore", item.name);
+                      }}
+                    >
+                      {webdavAction === "restore" ? <FaSpinner className="animate-spin" aria-hidden /> : <FaCloudDownloadAlt aria-hidden />}
+                      <span>恢复</span>
+                    </button>
+                    {item.name.startsWith("latest.") ? null : (
+                      <button
+                        type="button"
+                        className="inline-flex items-center gap-1 rounded-lg border border-zinc-300 px-2 py-1 font-medium text-zinc-500 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-600 dark:hover:bg-zinc-800"
+                        disabled={webdavAction !== ""}
+                        title={`删除云端备份 ${item.name}`}
+                        onClick={() => {
+                          if (!window.confirm(`删除云端备份「${item.name}」？`)) return;
+                          void runWebdavAction("delete", item.name);
+                        }}
+                      >
+                        <FaTrashAlt aria-hidden />
+                        <span className="sr-only">删除云端备份</span>
+                      </button>
+                    )}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="mt-2 text-[11px] leading-5 text-zinc-500">
+              点「刷新云端列表」查看云端已有备份；恢复会覆盖本地配置，覆盖前数据会另存到 data/restore-backup。
+            </p>
+          )}
+        </div>
+      )}
+    </section>
 
         <section className="flex min-w-0 max-h-[calc(100vh-7rem)] flex-col rounded-2xl border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900 p-3.5 shadow-sm sm:p-5">
           <div className="mb-3 space-y-2.5 shrink-0">

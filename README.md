@@ -76,6 +76,17 @@
 - 支持导出到 CC Switch，也支持直接唤起 CC Switch 导入
 - 当前已适配的目标 App 包括 `Claude`、`Codex`、`Gemini`、`OpenCode`、`OpenClaw`
 
+### ☁️ WebDAV 备份与同步
+
+- 左栏「新增配置」卡片底部有「WebDAV 备份与同步」折叠模块，首发对接坚果云：服务器地址默认 `https://dav.jianguoyun.com/dav`，账号填登录邮箱，密码填坚果云「安全选项 → 第三方应用管理」生成的**应用密码**（不是登录密码）
+- 上传的是一份完整快照：全部配置（含 Key）＋ 热点模型列表 ＋ 测试提问词。恢复即整体覆盖，适合换机器、重装、误删之后回滚
+- 默认加密上传：口令经 scrypt 派生 32 字节密钥，正文用 AES-256-GCM 封装，云端文件是 `.json.enc` 信封；口令保存在服务端配置里（留空表示不修改）。**口令丢失则云端备份无法恢复**，也可以关掉「加密上传」上传明文 JSON
+- 云端结构：`<云端目录>/latest.json(.enc)` 始终指向最近一次备份，历史备份放在 `<云端目录>/backups/apikeyhub-<北京时间戳>.json(.enc)`，按时间倒序展示，可单条「恢复」或删除
+- 每次备份后自动清理超出「保留备份份数」的旧文件（默认 10，最多 50）；「测试连接」会校验账号密码，并按需逐级创建云端目录
+- 「从云端恢复」会二次确认，覆盖前先把现有 `data/configs.json`、`data/hot-models.json` 另存到 `data/restore-backup/`；恢复完成后页面会自动刷新配置列表与热点模型
+- 坚果云的限制：免费版 600 次请求/30 分钟（付费版 1500 次）、单文件上传上限 500 MB、单次列目录最多 750 项。触发频率限制时会提示稍后再试，而不是静默失败
+- 只用 Node 原生 `fetch` 实现 WebDAV 客户端（PROPFIND / MKCOL / PUT / GET / DELETE），没有引入第三方依赖
+
 ### 🎨 界面与主题
 
 - 支持浅色 / 深色 / 跟随系统
@@ -94,6 +105,8 @@
 配置数据默认保存在**项目部署目录**的 `data/configs.json` 中，由同源接口 `/api/configs` 读写。该文件包含 API Key，已被 `.gitignore` / `.dockerignore` 排除，请勿提交到 Git，也不要输出到日志。
 
 热点模型列表保存在同目录的 `data/hot-models.json`，由 `/api/hot-models` 读写，不含密钥，只记录模型名与开关。
+
+WebDAV 备份的连接配置保存在同目录的 `data/webdav.json`（同样被 `.gitignore` / `.dockerignore` 排除，权限 0600），接口只回传 `hasPassword` / `hasPassphrase` 这类掩码，不回显明文密码与口令。上传到云端的备份默认加密；关掉加密后云端文件是明文 JSON，包含 API Key，请自行评估风险。「从云端恢复」在覆盖本地之前会把现有文件另存到 `data/restore-backup/`，便于回退。
 
 主题模式仍保存在浏览器 `localStorage`（键名 `ai-key-vault-theme-v1`）。
 
