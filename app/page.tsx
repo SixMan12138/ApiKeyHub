@@ -2065,6 +2065,14 @@ export default function Home() {
   const [probingAll, setProbingAll] = useState(false);
   // 左栏 Tab 切换：新增配置 vs WebDAV 备份与同步
   const [leftTab, setLeftTab] = useState<"config" | "webdav">("config");
+
+  // 支持 ?tab=webdav / ?tab=config 深链，刷新或分享链接时保持当前 Tab
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const requested = new URLSearchParams(window.location.search).get("tab");
+    if (requested === "config" || requested === "webdav") setLeftTab(requested);
+  }, []);
+
   const [webdavSaving, setWebdavSaving] = useState(false);
   const [webdavAction, setWebdavAction] = useState<"" | "test" | "backup" | "list" | "restore" | "delete">("");
   const [webdavForm, setWebdavForm] = useState<WebDavSettingsForm>({
